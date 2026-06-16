@@ -19,8 +19,6 @@ in
     };
 
     opencode = {
-      enable = lib.mkEnableOption "opencode <-> index-repo registration glue";
-
       hook = lib.mkOption {
         type = lib.types.str;
         readOnly = true;
