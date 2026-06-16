@@ -74,6 +74,12 @@
         model      = model;
       };
 
+      # NixOS module: services.index-repo.{enable,package,host,port,ssl,debounce,tuneInotify}
+      nixosModules.default = import ./nix/nixos-module.nix self;
+
+      # Home Manager module: opencode <-> index-repo glue (services.index-repo.opencode.*)
+      homeManagerModules.default = import ./nix/hm-module.nix self;
+
       devShells.${system}.default = pkgs.mkShell {
         nativeBuildInputs = [
           pkgs.cargo
