@@ -67,7 +67,16 @@ mod tests {
 
     #[test]
     fn loads_all_langs() {
-        for k in ["php", "go", "javascript", "typescript", "tsx", "python", "rust", "bash"] {
+        for k in [
+            "php",
+            "go",
+            "javascript",
+            "typescript",
+            "tsx",
+            "python",
+            "rust",
+            "bash",
+        ] {
             assert!(language_for(k).is_some(), "missing grammar {k}");
         }
         assert!(language_for("nope").is_none());
@@ -76,14 +85,14 @@ mod tests {
     #[test]
     fn each_lang_parses_trivial_snippet() {
         let snippets: &[(&str, &str)] = &[
-            ("php",        "<?php echo 1; ?>"),
-            ("go",         "package main\nfunc main() {}"),
+            ("php", "<?php echo 1; ?>"),
+            ("go", "package main\nfunc main() {}"),
             ("javascript", "function f() {}"),
             ("typescript", "function f(): void {}"),
-            ("tsx",        "const A = () => <div/>;"),
-            ("python",     "def f():\n    pass"),
-            ("rust",       "fn main() {}"),
-            ("bash",       "f() { echo hi; }"),
+            ("tsx", "const A = () => <div/>;"),
+            ("python", "def f():\n    pass"),
+            ("rust", "fn main() {}"),
+            ("bash", "f() { echo hi; }"),
         ];
         for (lang, snippet) in snippets {
             let language = language_for(lang).expect(lang);

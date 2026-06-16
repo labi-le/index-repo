@@ -254,7 +254,10 @@ mod tests {
 
     #[test]
     fn windows_with_overlap() {
-        let text = (1..=250).map(|n| n.to_string()).collect::<Vec<_>>().join("\n");
+        let text = (1..=250)
+            .map(|n| n.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
         let w = line_window(&text);
         assert_eq!(w[0].0, 1);
         assert_eq!(w[1].0, 101);
@@ -282,7 +285,11 @@ mod tests {
         let src = include_str!("../tests/fixtures/sample.py");
         let chunks = chunk_file(src, Path::new("sample.py"));
         let types: Vec<&str> = chunks.iter().map(|c| c.2.as_str()).collect();
-        assert!(types.contains(&"preamble"), "expected preamble, got: {:?}", types);
+        assert!(
+            types.contains(&"preamble"),
+            "expected preamble, got: {:?}",
+            types
+        );
         assert!(
             types.contains(&"function_definition"),
             "expected function_definition, got: {:?}",

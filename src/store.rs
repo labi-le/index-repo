@@ -115,8 +115,14 @@ mod tests {
     fn meta_scope_serializes() {
         let m = meta_with_scope();
         let v = serde_json::to_value(&m).unwrap();
-        assert_eq!(v["scope"], "MyStruct", "scope must be present when non-empty");
-        assert_eq!(v["type"], "function_item", "key must be 'type', not 'node_type'");
+        assert_eq!(
+            v["scope"], "MyStruct",
+            "scope must be present when non-empty"
+        );
+        assert_eq!(
+            v["type"], "function_item",
+            "key must be 'type', not 'node_type'"
+        );
         assert_eq!(v["lang"], "rs");
         assert_eq!(v["line"], 42);
         assert_eq!(v["path"], "src/foo.rs");
