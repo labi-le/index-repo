@@ -8,6 +8,9 @@
       system = "x86_64-linux";
       pkgs = import nixpkgs { inherit system; };
 
+      version = "0.1.0";
+      pname = "index-repo";
+
       # ---------------------------------------------------------------------------
       # Model FOD — 5 files from Qdrant/all-MiniLM-L6-v2-onnx on HuggingFace
       # ---------------------------------------------------------------------------
@@ -36,29 +39,33 @@
       '';
 
       # ---------------------------------------------------------------------------
-      # Rust package
+      # Pre-built binary fetched from GitHub Releases
+      # update-flake workflow patches version + hash automatically on each release
       # ---------------------------------------------------------------------------
-      indexRepo = pkgs.rustPlatform.buildRustPackage {
-        pname = "index-repo";
-        version = "0.1.0";
-        src = ./.;
-        cargoLock.lockFile = ./Cargo.lock;
+      indexRepo = pkgs.stdenv.mkDerivation {
+        inherit pname version;
 
-        # ort uses load-dynamic — no onnxruntime link at build time.
-        # tree-sitter grammar crates compile C via cc (provided by stdenv.cc).
+        src = pkgs.fetchurl {
+          url = "https://github.com/labi-le/index-repo/releases/download/v${version}/index-repo_linux_amd64";
+          hash = "sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="; # x86_64-linux
+        };
+
+        dontUnpack = true;
+
         nativeBuildInputs = [ pkgs.makeWrapper ];
 
+        installPhase = ''
+          mkdir -p $out/bin
+          cp $src $out/bin/${pname}
+          chmod +x $out/bin/${pname}
+        '';
+
         # Wrap the binary so it finds onnxruntime and the model at runtime.
-        postInstall = ''
-          wrapProgram $out/bin/index-repo \
+        postFixup = ''
+          wrapProgram $out/bin/${pname} \
             --set ORT_DYLIB_PATH ${pkgs.onnxruntime}/lib/libonnxruntime.so \
             --set INDEX_REPO_MODEL_DIR ${model}
         '';
-
-        # cargo test passes in the sandbox:
-        #   - embed test skips without ORT_DYLIB_PATH / INDEX_REPO_MODEL_DIR
-        #   - all other tests use only tmpfs + in-memory state
-        doCheck = true;
 
         meta = with pkgs.lib; {
           description = "Fast semantic code indexer for ChromaDB (tree-sitter + fastembed)";
@@ -89,7 +96,7 @@
           pkgs.pkg-config
         ];
         # Runtime env so `cargo test embed::` and the binary work from the devShell.
-        ORT_DYLIB_PATH     = "${pkgs.onnxruntime}/lib/libonnxruntime.so";
+        ORT_DYLIB_PATH       = "${pkgs.onnxruntime}/lib/libonnxruntime.so";
         INDEX_REPO_MODEL_DIR = "${model}";
       };
     };
