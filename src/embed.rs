@@ -1,0 +1,122 @@
+use anyhow::{Context, Result};
+use fastembed::{
+    InitOptionsUserDefined, Pooling, TextEmbedding, TokenizerFiles, UserDefinedEmbeddingModel,
+};
+use std::path::Path;
+use std::sync::{Mutex, Once};
+
+// ---------------------------------------------------------------------------
+// ORT dynamic-library initialisation (load-dynamic strategy)
+// ---------------------------------------------------------------------------
+
+static ORT_INIT: Once = Once::new();
+
+/// If `ORT_DYLIB_PATH` is set, initialise ort from that path before any model
+/// use.  Called at most once per process.  Ignores errors after the first init
+/// (ort's `commit()` returns `false` when an environment already exists).
+fn maybe_init_ort() {
+    ORT_INIT.call_once(|| {
+        if let Ok(path) = std::env::var("ORT_DYLIB_PATH") {
+            match ort::init_from(&path) {
+                Ok(builder) => {
+                    builder.commit(); // returns bool; false just means already init'd
+                }
+                Err(e) => {
+                    eprintln!("embed: ort::init_from({path}) failed: {e}");
+                }
+            }
+        }
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Embedder
+// ---------------------------------------------------------------------------
+
+/// Local all-MiniLM-L6-v2 embedder backed by fastembed + ort (load-dynamic).
+///
+/// `embed()` takes `&self` via `Embed` trait, so we wrap `TextEmbedding`
+/// (which requires `&mut self`) in a `Mutex`.
+pub struct Embedder {
+    model: Mutex<TextEmbedding>,
+}
+
+impl Embedder {
+    /// Construct from `INDEX_REPO_MODEL_DIR` env var.
+    pub fn from_env() -> Result<Self> {
+        let dir = std::env::var("INDEX_REPO_MODEL_DIR").context("INDEX_REPO_MODEL_DIR not set")?;
+        Self::from_dir(Path::new(&dir))
+    }
+
+    /// Load the model from the 5 files in `dir`:
+    /// `model.onnx`, `tokenizer.json`, `config.json`,
+    /// `special_tokens_map.json`, `tokenizer_config.json`.
+    pub fn from_dir(dir: &Path) -> Result<Self> {
+        // Initialise ort from the dylib path if provided (must happen before
+        // any model is constructed).
+        maybe_init_ort();
+
+        let onnx_bytes = std::fs::read(dir.join("model.onnx")).context("reading model.onnx")?;
+        let tokenizer_files = TokenizerFiles {
+            tokenizer_file: std::fs::read(dir.join("tokenizer.json"))
+                .context("reading tokenizer.json")?,
+            config_file: std::fs::read(dir.join("config.json")).context("reading config.json")?,
+            special_tokens_map_file: std::fs::read(dir.join("special_tokens_map.json"))
+                .context("reading special_tokens_map.json")?,
+            tokenizer_config_file: std::fs::read(dir.join("tokenizer_config.json"))
+                .context("reading tokenizer_config.json")?,
+        };
+
+        let model_def =
+            UserDefinedEmbeddingModel::new(onnx_bytes, tokenizer_files).with_pooling(Pooling::Mean); // all-MiniLM-L6-v2: mean-pool + L2-norm
+
+        let te =
+            TextEmbedding::try_new_from_user_defined(model_def, InitOptionsUserDefined::default())?;
+
+        Ok(Self {
+            model: Mutex::new(te),
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Embed trait impl
+// ---------------------------------------------------------------------------
+
+impl crate::store::Embed for Embedder {
+    fn embed(&self, docs: &[String]) -> Result<Vec<Vec<f32>>> {
+        if docs.is_empty() {
+            return Ok(vec![]);
+        }
+        let mut guard = self.model.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
+        // fastembed embed() returns Vec<Vec<f32>> (Embedding = Vec<f32>)
+        let out = guard.embed(docs, None)?;
+        Ok(out)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::Embed as _;
+
+    /// Skips unless ORT_DYLIB_PATH and INDEX_REPO_MODEL_DIR are both set.
+    #[test]
+    fn embeds_384_dims() {
+        let (Ok(_dylib), Ok(dir)) = (
+            std::env::var("ORT_DYLIB_PATH"),
+            std::env::var("INDEX_REPO_MODEL_DIR"),
+        ) else {
+            eprintln!("skipping: ORT_DYLIB_PATH/INDEX_REPO_MODEL_DIR unset");
+            return;
+        };
+        let e = Embedder::from_dir(Path::new(&dir)).unwrap();
+        let v = e.embed(&["hello world".to_string()]).unwrap();
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].len(), 384);
+    }
+}

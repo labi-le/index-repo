@@ -3,6 +3,7 @@ pub mod chunk;
 pub mod chunkfile;
 pub mod config;
 pub mod daemon;
+pub mod embed;
 pub mod grammar;
 pub mod oneshot;
 pub mod splitlines;

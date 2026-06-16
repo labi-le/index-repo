@@ -447,7 +447,7 @@ mod tests {
 
         // --- Phase 1: delete a.py ---
         let changes = vec![(Evt::Delete, py_path.clone())];
-        let spec = crate::walk::load_ignore(d.path());
+        let _spec = crate::walk::load_ignore(d.path());
         let (added, deleted) = process_changes(
             &mut mock,
             &FakeEmbed,
