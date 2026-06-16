@@ -2,7 +2,7 @@ use crate::config::{
     ext_to_lang, scope_types, semantic_types, CHUNK_LINES, MAX_SEMANTIC_LINES, OVERLAP,
 };
 use crate::grammar::language_for;
-use crate::splitlines::py_splitlines;
+use crate::splitlines::{is_py_blank, py_splitlines};
 use std::path::Path;
 use tree_sitter::{Node, Parser};
 
@@ -29,7 +29,7 @@ pub fn line_window(text: &str) -> Vec<(usize, String)> {
     for i in (0..len).step_by(step) {
         let end = (i + CHUNK_LINES).min(len);
         let body = lines[i..end].join("\n");
-        if !body.trim().is_empty() {
+        if !is_py_blank(&body) {
             result.push((i + 1, body));
         }
         if i + CHUNK_LINES >= len {
@@ -157,7 +157,7 @@ pub fn ts_chunk(text: &str, lang: &str) -> Vec<Chunk> {
         // Gap before this node → line-window as "preamble"
         if cursor < node_start {
             let gap = lines[cursor..node_start].join("\n");
-            if !gap.trim().is_empty() {
+            if !is_py_blank(&gap) {
                 for (off, body) in line_window(&gap) {
                     results.push((cursor + off, body, "preamble".to_string(), String::new()));
                 }
@@ -189,7 +189,7 @@ pub fn ts_chunk(text: &str, lang: &str) -> Vec<Chunk> {
     // Trailing gap
     if cursor < total {
         let gap = lines[cursor..].join("\n");
-        if !gap.trim().is_empty() {
+        if !is_py_blank(&gap) {
             for (off, body) in line_window(&gap) {
                 results.push((cursor + off, body, "preamble".to_string(), String::new()));
             }
@@ -275,6 +275,14 @@ mod tests {
     fn single_short() {
         let w = line_window("a\nb");
         assert_eq!(w, vec![(1, "a\nb".to_string())]);
+    }
+
+    #[test]
+    fn us_separator_only_window_is_suppressed() {
+        // U+001F (US) is NOT a splitlines boundary but IS whitespace to Python
+        // str.strip(); such a window must be suppressed to match Python (it would
+        // otherwise emit an extra chunk and diverge the chunk-ID set).
+        assert!(line_window("\u{1f}\u{1f}\u{1f}").is_empty());
     }
 
     // ---- Task 6: semantic chunking ----

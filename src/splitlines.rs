@@ -83,9 +83,20 @@ fn utf8_char_len(b: u8) -> usize {
     }
 }
 
+/// True if `s` is empty or consists only of Python-`str.isspace()` whitespace.
+///
+/// Mirrors Python `not s.strip()`. Rust's `char::is_whitespace` follows the
+/// Unicode `White_Space` property, which omits the C0 separators
+/// U+001C..U+001F (FS, GS, RS, US) that Python treats as whitespace; this
+/// helper adds them back so blank-detection matches Python exactly.
+pub fn is_py_blank(s: &str) -> bool {
+    s.chars()
+        .all(|c| c.is_whitespace() || ('\u{1c}'..='\u{1f}').contains(&c))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::py_splitlines;
+    use super::{is_py_blank, py_splitlines};
 
     #[test]
     fn basic_lf() {
@@ -135,5 +146,17 @@ mod tests {
     #[test]
     fn only_newline() {
         assert_eq!(py_splitlines("\n"), vec![""]);
+    }
+
+    #[test]
+    fn is_py_blank_matches_python_strip() {
+        assert!(is_py_blank(""));
+        assert!(is_py_blank("   \t"));
+        // FS, GS, RS, US — Python str.isspace() == True, Rust is_whitespace == false
+        assert!(is_py_blank("\u{1c}\u{1d}\u{1e}\u{1f}"));
+        assert!(is_py_blank("\u{1f}\u{1f}"));
+        assert!(is_py_blank("\u{85}\u{2028}\u{2029}"));
+        assert!(!is_py_blank("\u{1f}x"));
+        assert!(!is_py_blank("a"));
     }
 }
