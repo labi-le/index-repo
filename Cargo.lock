@@ -888,6 +888,7 @@ dependencies = [
  "clap",
  "fastembed",
  "ignore",
+ "libc",
  "notify-debouncer-full",
  "ort",
  "reqwest",

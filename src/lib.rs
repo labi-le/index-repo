@@ -6,6 +6,7 @@ pub mod daemon;
 pub mod embed;
 pub mod grammar;
 pub mod oneshot;
+pub mod registry;
 pub mod splitlines;
 pub mod store;
 pub mod walk;
