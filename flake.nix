@@ -39,20 +39,31 @@
       '';
 
       # ---------------------------------------------------------------------------
-      # Pre-built binary fetched from GitHub Releases
-      # update-flake workflow patches version + hash automatically on each release
+      # Pre-built binary fetched from GitHub Releases.
+      # The release artifact is a plain glibc Linux ELF (built via `cargo build
+      # --release` on ubuntu-latest, no Nix), so the fetchurl FOD is reference-
+      # free. autoPatchelfHook then rewrites the interpreter + RPATH to the
+      # current /nix/store glibc inside the (non-FOD) wrapping derivation.
+      # update-flake.yaml patches version + hash automatically on each release.
       # ---------------------------------------------------------------------------
       indexRepo = pkgs.stdenv.mkDerivation {
         inherit pname version;
 
         src = pkgs.fetchurl {
           url = "https://github.com/labi-le/index-repo/releases/download/v${version}/index-repo_linux_amd64";
-          hash = "sha256-VOBD4fVE4gOpUYZDDa1FR3k1Nb3nzQdiIrh0lgk/BDA="; # x86_64-linux
+          hash = "sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="; # x86_64-linux
         };
 
         dontUnpack = true;
 
-        nativeBuildInputs = [ pkgs.makeWrapper ];
+        nativeBuildInputs = [
+          pkgs.makeWrapper
+          pkgs.autoPatchelfHook
+        ];
+
+        buildInputs = [
+          pkgs.stdenv.cc.cc.lib
+        ];
 
         installPhase = ''
           mkdir -p $out/bin

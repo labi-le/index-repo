@@ -17,13 +17,15 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Install Nix
-        uses: DeterminateSystems/nix-installer-action@main
+      - name: Install Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
 
       - name: Build binary
         run: |
-          nix build .#fromSource
-          cp result/bin/index-repo index-repo_linux_amd64
+          cargo build --release --locked
+          cp target/release/index-repo index-repo_linux_amd64
 
       - name: Generate checksums
         run: |
