@@ -889,6 +889,7 @@ dependencies = [
  "fastembed",
  "ignore",
  "notify-debouncer-full",
+ "once_cell",
  "ort",
  "reqwest",
  "serde",

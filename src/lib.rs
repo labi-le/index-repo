@@ -5,6 +5,7 @@ pub mod config;
 pub mod daemon;
 pub mod embed;
 pub mod grammar;
+pub mod lazy;
 pub mod oneshot;
 pub mod splitlines;
 pub mod store;
