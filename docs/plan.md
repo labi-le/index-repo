@@ -12,6 +12,25 @@
 
 ---
 
+## Build environment (read first)
+
+There is **no global Rust toolchain**, but the machine has an existing Nix devshell `dev#rust` providing nixpkgs `cargo`, `rustup`, `pkg-config`, and `openssl`. The rustup `stable` toolchain (1.96.0 — rustc+cargo matched) is **already installed and set as default**. Therefore:
+
+- **Do not create a toolchain devShell.** Use the existing one. Run every build/test command as: `nix develop dev#rust -c rustup run stable cargo ...` — e.g. `nix develop dev#rust -c rustup run stable cargo build`, `... cargo test ...`, `... cargo clippy -- -D warnings`, `... cargo fmt`. Tasks write bare `cargo ...` for brevity; **always** wrap with `nix develop dev#rust -c rustup run stable`. Use `rustup run stable cargo` (not the bare nixpkgs `cargo` on PATH) so cargo and rustc are the same 1.96.0 release (the bare `cargo` is 1.95 and would mismatch the rustup `rustc`).
+- The in-repo `flake.nix` (Task 14) is for the **package** + model FOD (for nixos to consume), NOT the dev toolchain. It only sees git-tracked files, so `git add` new files before building via that flake.
+- **Defer onnxruntime:** add `fastembed` to `Cargo.toml` only at Task 9. Tasks 0–8 build with no onnxruntime. `dev#rust` does **not** provide onnxruntime; from Task 9 on, layer it into the command:
+  ```bash
+  nix develop dev#rust -c bash -c '
+    export ORT_STRATEGY=system
+    export ORT_LIB_LOCATION="$(nix build --no-link --print-out-paths nixpkgs#onnxruntime)/lib"
+    export CARGO_NET_OFFLINE=1
+    rustup run stable cargo build'
+  ```
+  This `ort`↔system-onnxruntime link is the sharpest edge (no nixpkgs precedent) — if linking fails, verify those env vars and that `$ORT_LIB_LOCATION/libonnxruntime.so` exists, and escalate.
+- `hyperfine` (Task 16) is absent → use `nix run nixpkgs#hyperfine -- ...`.
+
+---
+
 ## File Structure
 
 ```
