@@ -22,7 +22,7 @@ jobs:
 
       - name: Build binary
         run: |
-          nix build .#index-repo
+          nix build .#fromSource
           cp result/bin/index-repo index-repo_linux_amd64
 
       - name: Generate checksums

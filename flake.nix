@@ -74,10 +74,30 @@
         };
       };
 
+      # ---------------------------------------------------------------------------
+      # Source build — compiles the raw binary. Used by CI (release.yaml) to
+      # produce the release artifact that `indexRepo` (above) later fetches.
+      # Intentionally UNWRAPPED: the artifact must be a portable ELF; the
+      # prebuilt `index-repo` package wraps it with ORT_DYLIB_PATH + model.
+      # ---------------------------------------------------------------------------
+      fromSource = pkgs.rustPlatform.buildRustPackage {
+        inherit pname version;
+        src = ./.;
+        cargoLock.lockFile = ./Cargo.lock;
+        doCheck = true;
+
+        meta = with pkgs.lib; {
+          description = "Fast semantic code indexer for ChromaDB (built from source)";
+          license = licenses.mit;
+          platforms = [ "x86_64-linux" ];
+        };
+      };
+
     in {
       packages.${system} = {
         default    = indexRepo;
         index-repo = indexRepo;
+        fromSource = fromSource;
         model      = model;
       };
 
