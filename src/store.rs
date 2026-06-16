@@ -68,7 +68,7 @@ pub trait Store {
     /// Paginated fetch of ALL chunk ids from the current collection.
     fn existing_ids(&self) -> Result<HashSet<String>>;
 
-    /// Paginated fetch of all (id, path) pairs from chunk metadatas.
+    /// Paginated fetch of all (id, meta) pairs from chunk metadatas.
     /// Used by the daemon to build its path→ids map (spec §7).
     fn metadatas(&self) -> Result<Vec<(String, Meta)>>;
 
@@ -81,6 +81,17 @@ pub trait Store {
 
     /// Count records in the current collection.
     fn count(&self) -> Result<usize>;
+}
+
+// ---------------------------------------------------------------------------
+// Embed trait
+// ---------------------------------------------------------------------------
+
+/// Abstraction over embedding computation.
+/// Implemented by the real fastembed embedder (Task 9) and FakeEmbed in tests.
+pub trait Embed {
+    /// Embed document bodies → one 384-dim L2-normalised vector each, in order.
+    fn embed(&self, docs: &[String]) -> Result<Vec<Vec<f32>>>;
 }
 
 // ---------------------------------------------------------------------------
@@ -154,72 +165,9 @@ mod tests {
         assert_eq!(s.added, 0);
     }
 
-    /// Minimal in-memory mock Store for use in oneshot/daemon tests.
-    #[cfg(test)]
-    pub struct MockStore {
-        pub ids: HashSet<String>,
-        pub metas: Vec<(String, Meta)>,
-        pub added: Vec<(Record, Vec<f32>)>,
-        pub deleted: Vec<String>,
-        pub collection: Option<String>,
-    }
-
-    #[cfg(test)]
-    impl MockStore {
-        pub fn new() -> Self {
-            Self {
-                ids: HashSet::new(),
-                metas: Vec::new(),
-                added: Vec::new(),
-                deleted: Vec::new(),
-                collection: None,
-            }
-        }
-    }
-
-    #[cfg(test)]
-    impl Store for MockStore {
-        fn heartbeat(&self) -> Result<()> {
-            Ok(())
-        }
-        fn get_or_create(&mut self, name: &str) -> Result<()> {
-            self.collection = Some(name.to_string());
-            Ok(())
-        }
-        fn delete_collection(&mut self, _name: &str) -> Result<()> {
-            self.ids.clear();
-            self.metas.clear();
-            Ok(())
-        }
-        fn existing_ids(&self) -> Result<HashSet<String>> {
-            Ok(self.ids.clone())
-        }
-        fn metadatas(&self) -> Result<Vec<(String, Meta)>> {
-            Ok(self.metas.clone())
-        }
-        fn add(&mut self, records: &[Record], embeddings: &[Vec<f32>]) -> Result<usize> {
-            for (r, e) in records.iter().zip(embeddings.iter()) {
-                self.ids.insert(r.id.clone());
-                self.metas.push((r.id.clone(), r.meta.clone()));
-                self.added.push((r.clone(), e.clone()));
-            }
-            Ok(records.len())
-        }
-        fn delete(&mut self, ids: &[String]) -> Result<usize> {
-            let n = ids.len();
-            for id in ids {
-                self.ids.remove(id);
-                self.deleted.push(id.clone());
-            }
-            Ok(n)
-        }
-        fn count(&self) -> Result<usize> {
-            Ok(self.ids.len())
-        }
-    }
-
     #[test]
     fn mock_store_add_delete() {
+        use crate::testkit::MockStore;
         let mut store = MockStore::new();
         store.get_or_create("test-col").unwrap();
         assert_eq!(store.collection.as_deref(), Some("test-col"));
