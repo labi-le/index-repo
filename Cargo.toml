@@ -1,0 +1,14 @@
+[package]
+name = "index-repo"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "index-repo"
+path = "src/main.rs"
+
+[lib]
+name = "index_repo"
+path = "src/lib.rs"
+
+[dependencies]
