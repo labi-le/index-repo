@@ -1,3 +1,236 @@
-fn main() -> std::process::ExitCode {
-    std::process::ExitCode::from(0)
+use clap::Parser;
+use index_repo::store::Store as _;
+use std::path::PathBuf;
+use std::process::ExitCode;
+
+// ---------------------------------------------------------------------------
+// CLI arguments (spec §10.1 / Python parse_args)
+// ---------------------------------------------------------------------------
+
+#[derive(Parser, Debug)]
+#[command(about = "Semantic code indexer for ChromaDB using tree-sitter AST parsing.")]
+pub struct Args {
+    /// Project directory to index (default: current directory)
+    #[arg(default_value = ".")]
+    pub path: String,
+
+    /// ChromaDB host
+    #[arg(long, default_value = "192.168.1.2")]
+    pub host: String,
+
+    /// ChromaDB port
+    #[arg(long, default_value_t = 8000)]
+    pub port: u16,
+
+    /// Collection name (default: code-<basename>)
+    #[arg(long)]
+    pub collection: Option<String>,
+
+    /// Use HTTPS
+    #[arg(long, default_value_t = false)]
+    pub ssl: bool,
+
+    /// Drop the collection and re-embed everything
+    #[arg(long, default_value_t = false)]
+    pub full_rebuild: bool,
+
+    /// Run as a long-lived live indexer
+    #[arg(long, default_value_t = false)]
+    pub daemon: bool,
+
+    /// Daemon fs-event debounce window in ms
+    #[arg(long, default_value_t = 800)]
+    pub debounce: u64,
+}
+
+// ---------------------------------------------------------------------------
+// Entry point
+// ---------------------------------------------------------------------------
+
+fn main() -> ExitCode {
+    let args = Args::parse();
+    match run(args) {
+        Ok(code) => code,
+        Err(e) => {
+            eprintln!("error: {e:#}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Inner run — returns Result so `?` propagates unexpected errors cleanly
+// ---------------------------------------------------------------------------
+
+fn run(args: Args) -> anyhow::Result<ExitCode> {
+    // Step 1: resolve root path; use canonicalize, fall back to absolute.
+    // Python: root = Path(args.path).resolve()
+    let root: PathBuf = std::fs::canonicalize(&args.path).unwrap_or_else(|_| {
+        // Path doesn't exist yet — still produce an absolute path for the error message.
+        std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join(&args.path)
+    });
+
+    if !root.is_dir() {
+        // Python: print(f"error: {root} is not a directory", file=sys.stderr)
+        eprintln!("error: {} is not a directory", root.display());
+        return Ok(ExitCode::from(2));
+    }
+
+    // Step 2: collection name  (Python: collection_name = args.collection or f"code-{root.name}")
+    let collection_name = args.collection.clone().unwrap_or_else(|| {
+        format!(
+            "code-{}",
+            root.file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("unknown")
+        )
+    });
+
+    // Step 3: mode string
+    let mode_str = if args.daemon {
+        "daemon"
+    } else if args.full_rebuild {
+        "full rebuild"
+    } else {
+        "incremental"
+    };
+
+    // Step 4: startup line (Python: file=sys.stderr)
+    // Python: f"indexing {root} → {args.host}:{args.port}  collection={collection_name} mode={mode_str}"
+    // Arrow is U+2192 →, two spaces before collection=
+    eprintln!(
+        "indexing {} \u{2192} {}:{}  collection={} mode={}",
+        root.display(),
+        args.host,
+        args.port,
+        collection_name,
+        mode_str
+    );
+
+    // Step 5: heartbeat / reachability
+    let mut store = index_repo::chroma::HttpStore::new(&args.host, args.port, args.ssl);
+    if let Err(e) = store.heartbeat() {
+        // Python: print(f"error: cannot reach chromadb at {host}:{port} ({e})\nis `systemctl...`",
+        //               file=sys.stderr)
+        eprintln!(
+            "error: cannot reach chromadb at {}:{} ({})\nis `systemctl status chromadb` running?",
+            args.host, args.port, e
+        );
+        return Ok(ExitCode::from(3));
+    }
+
+    // Step 6: build ignore spec
+    let spec = index_repo::walk::load_ignore(&root);
+
+    // Step 7: full rebuild — delete collection (errors swallowed internally)
+    if args.full_rebuild {
+        let _ = store.delete_collection(&collection_name);
+    }
+
+    // Step 8: get or create collection
+    store.get_or_create(&collection_name)?;
+
+    // Step 9: build embedder (requires INDEX_REPO_MODEL_DIR)
+    let embedder = index_repo::embed::Embedder::from_env()?;
+
+    // Step 10: daemon mode
+    if args.daemon {
+        let code =
+            index_repo::daemon::run_daemon(&mut store, &embedder, &root, &spec, args.debounce)?;
+        return Ok(ExitCode::from(code as u8));
+    }
+
+    // Step 11: one-shot incremental index
+    let stats = index_repo::oneshot::one_shot_index(&mut store, &embedder, &root, &spec)?;
+    let grammars = index_repo::grammar::used_grammars_str();
+    let count = store.count()?;
+
+    // Python: print(f"done. files=... ", file=sys.stderr)
+    eprintln!(
+        "done. files={} added={} unchanged={} deleted={} \
+         (tree-sitter={}, window={}) skipped_binary={} grammars={} \
+         collection={} count={}",
+        stats.files,
+        stats.added,
+        stats.unchanged,
+        stats.deleted,
+        stats.ts_chunks,
+        stats.win_chunks,
+        stats.skipped_bin,
+        grammars,
+        collection_name,
+        count
+    );
+
+    Ok(ExitCode::SUCCESS)
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn defaults() {
+        let a = Args::parse_from(["index-repo"]);
+        assert_eq!(a.host, "192.168.1.2");
+        assert_eq!(a.port, 8000);
+        assert_eq!(a.debounce, 800);
+        assert_eq!(a.path, ".");
+        assert!(!a.daemon);
+        assert!(!a.full_rebuild);
+        assert!(!a.ssl);
+        assert!(a.collection.is_none());
+    }
+
+    #[test]
+    fn all_flags_parsed() {
+        let a = Args::parse_from([
+            "index-repo",
+            "/some/path",
+            "--host",
+            "10.0.0.1",
+            "--port",
+            "9000",
+            "--collection",
+            "my-col",
+            "--ssl",
+            "--full-rebuild",
+            "--daemon",
+            "--debounce",
+            "400",
+        ]);
+        assert_eq!(a.path, "/some/path");
+        assert_eq!(a.host, "10.0.0.1");
+        assert_eq!(a.port, 9000);
+        assert_eq!(a.collection.as_deref(), Some("my-col"));
+        assert!(a.ssl);
+        assert!(a.full_rebuild);
+        assert!(a.daemon);
+        assert_eq!(a.debounce, 400);
+    }
+
+    #[test]
+    fn not_a_dir_returns_code_2() {
+        // Drive the not-a-dir branch without any network call by calling run()
+        // with a path that is clearly not a directory.
+        let a = Args {
+            path: "/tmp/this_path_definitely_does_not_exist_xyz_12345".to_string(),
+            host: "127.0.0.1".to_string(),
+            port: 9999,
+            collection: None,
+            ssl: false,
+            full_rebuild: false,
+            daemon: false,
+            debounce: 800,
+        };
+        let result = run(a).unwrap();
+        assert_eq!(result, ExitCode::from(2));
+    }
 }
