@@ -47,7 +47,7 @@ pub fn language_for(key: &str) -> Option<Language> {
 pub fn used_grammars_str() -> String {
     match USED_GRAMMARS.lock() {
         Ok(set) if set.is_empty() => "none".to_string(),
-        Ok(set) => set.iter().copied().collect::<Vec<_>>().join(","),
+        Ok(set) => set.iter().copied().collect::<Vec<_>>().join(", "),
         Err(_) => "none".to_string(),
     }
 }

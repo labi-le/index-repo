@@ -59,7 +59,9 @@ pub fn build_path_to_ids(store: &dyn Store) -> HashMap<String, HashSet<String>> 
         }
     };
     for (id, meta) in pairs {
-        mapping.entry(meta.path).or_default().insert(id);
+        if !meta.path.is_empty() {
+            mapping.entry(meta.path).or_default().insert(id);
+        }
     }
     mapping
 }
@@ -155,17 +157,18 @@ pub fn process_changes(
             let docs: Vec<String> = new_records.iter().map(|r| r.body.clone()).collect();
             match embedder.embed(&docs) {
                 Ok(embeddings) => {
-                    if let Some(n) = safe!(store.add(&new_records, &embeddings)) {
-                        for r in &new_records {
-                            all_ids.insert(r.id.clone());
-                        }
-                        added += n;
-                    }
+                    let _ = safe!(store.add(&new_records, &embeddings));
                 }
                 Err(e) => {
                     eprintln!("daemon: chromadb call failed ({e})");
                 }
             }
+            // State updates are UNCONDITIONAL (mirrors Python which updates all_ids/added
+            // regardless of whether col.add succeeded — the call is fire-and-forget via _safe)
+            for r in &new_records {
+                all_ids.insert(r.id.clone());
+            }
+            added += new_records.len();
         }
 
         path_to_ids.insert(rel.clone(), seen);
@@ -320,10 +323,10 @@ pub fn run_daemon(
                 }
             }
             Ok(Err(errors)) => {
-                // Watcher errors — log each and continue
                 for e in errors {
                     eprintln!("daemon: watch loop crashed ({e})");
                 }
+                return Ok(4);
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                 // Normal — check stop flag and loop
