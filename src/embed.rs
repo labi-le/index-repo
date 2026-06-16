@@ -11,6 +11,11 @@ use std::sync::{Mutex, Once};
 
 static ORT_INIT: Once = Once::new();
 
+// Bounds the retained ort CPU arena (~8 GB at default all-cores/batch-256 on a
+// large index). Both are parity-safe: neither changes embedding values.
+const INTRA_THREADS: usize = 4;
+const EMBED_BATCH: usize = 32;
+
 /// If `ORT_DYLIB_PATH` is set, initialise ort from that path before any model
 /// use.  Called at most once per process.  Ignores errors after the first init
 /// (ort's `commit()` returns `false` when an environment already exists).
@@ -70,8 +75,10 @@ impl Embedder {
         let model_def =
             UserDefinedEmbeddingModel::new(onnx_bytes, tokenizer_files).with_pooling(Pooling::Mean); // all-MiniLM-L6-v2: mean-pool + L2-norm
 
-        let te =
-            TextEmbedding::try_new_from_user_defined(model_def, InitOptionsUserDefined::default())?;
+        let te = TextEmbedding::try_new_from_user_defined(
+            model_def,
+            InitOptionsUserDefined::default().with_intra_threads(INTRA_THREADS),
+        )?;
 
         Ok(Self {
             model: Mutex::new(te),
@@ -90,7 +97,7 @@ impl crate::store::Embed for Embedder {
         }
         let mut guard = self.model.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
         // fastembed embed() returns Vec<Vec<f32>> (Embedding = Vec<f32>)
-        let out = guard.embed(docs, None)?;
+        let out = guard.embed(docs, Some(EMBED_BATCH))?;
         Ok(out)
     }
 }
