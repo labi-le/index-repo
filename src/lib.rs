@@ -8,6 +8,7 @@ pub mod grammar;
 pub mod lazy;
 pub mod oneshot;
 pub mod registry;
+pub mod service;
 pub mod splitlines;
 pub mod store;
 pub mod walk;

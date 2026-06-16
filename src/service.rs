@@ -1,0 +1,417 @@
+//! Singleton always-on service: one dispatcher + N per-root actors sharing a
+//! single lazily-loaded embedding model.
+//!
+//! Pure orchestration layer. Reuses the parity-critical core unchanged:
+//! `one_shot_index`, `process_changes`, `build_path_to_ids`, `watch_keep`,
+//! `evt_for`. See `docs/service-design.md`.
+
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender};
+use std::sync::Arc;
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
+
+use anyhow::Result;
+use notify_debouncer_full::new_debouncer;
+use notify_debouncer_full::notify::{RecursiveMode, Watcher};
+
+use crate::chroma::HttpStore;
+use crate::daemon::{build_path_to_ids, evt_for, process_changes, watch_keep, Evt};
+use crate::lazy::LazyEmbedder;
+use crate::oneshot::one_shot_index;
+use crate::registry::Registry;
+use crate::store::Store;
+use crate::walk::{load_ignore, Ignore};
+
+// ChromaDB connection defaults (same as the legacy CLI defaults).
+const CHROMA_HOST: &str = "192.168.1.2";
+const CHROMA_PORT: u16 = 8000;
+const CHROMA_SSL: bool = false;
+
+// Debounce window for the shared watcher (ms).
+const DEBOUNCE_MS: u64 = 800;
+
+// Periodic GC / reconcile sweep interval.
+const GC_INTERVAL: Duration = Duration::from_secs(30);
+
+// ---------------------------------------------------------------------------
+// Pure helpers (unit-tested below — no threads / fs / network)
+// ---------------------------------------------------------------------------
+
+/// Longest canonical-prefix match: return the deepest root that is a path
+/// prefix of `path`. `None` if `path` lives under no root.
+///
+/// `Path::starts_with` is component-wise, so `/a/bb` is NOT a prefix of
+/// `/a/b/c` — only true ancestors match. Among matches the deepest (most
+/// components) wins, which is the owning root for nested roots.
+pub fn route<'a>(path: &Path, roots: &'a [PathBuf]) -> Option<&'a PathBuf> {
+    roots
+        .iter()
+        .filter(|r| path.starts_with(r))
+        .max_by_key(|r| r.components().count())
+}
+
+/// Compute `(to_start, to_stop)` between the desired root set and the currently
+/// running set. `to_start` preserves `desired` order; `to_stop` is the current
+/// roots no longer desired.
+pub fn reconcile_diff(
+    desired: &[PathBuf],
+    current: &HashSet<PathBuf>,
+) -> (Vec<PathBuf>, Vec<PathBuf>) {
+    let desired_set: HashSet<&PathBuf> = desired.iter().collect();
+    let to_start: Vec<PathBuf> = desired
+        .iter()
+        .filter(|d| !current.contains(*d))
+        .cloned()
+        .collect();
+    let to_stop: Vec<PathBuf> = current
+        .iter()
+        .filter(|c| !desired_set.contains(*c))
+        .cloned()
+        .collect();
+    (to_start, to_stop)
+}
+
+// ---------------------------------------------------------------------------
+// Per-root actor
+// ---------------------------------------------------------------------------
+
+/// Dispatcher-side handle to a per-root actor thread.
+struct Actor {
+    /// Send a debounced batch of `(Evt, PathBuf)` to the actor. Dropping this
+    /// sender closes the channel → the actor drains and exits (Stop signal).
+    tx: Sender<Vec<(Evt, PathBuf)>>,
+    join: JoinHandle<()>,
+}
+
+/// Per-root actor thread body. Owns its `HttpStore`, `path_to_ids`, `all_ids`.
+/// Runs the initial `one_shot_index`, then serially applies batches.
+fn actor_loop(root: PathBuf, embedder: Arc<LazyEmbedder>, rx: Receiver<Vec<(Evt, PathBuf)>>) {
+    let collection = format!(
+        "code-{}",
+        root.file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("unknown")
+    );
+
+    let mut store = HttpStore::new(CHROMA_HOST, CHROMA_PORT, CHROMA_SSL);
+    if let Err(e) = store.get_or_create(&collection) {
+        eprintln!("service: {} get_or_create failed: {e}", root.display());
+        return;
+    }
+
+    let spec = load_ignore(&root);
+
+    // Initial sync — same primitive the daemon uses.
+    let stats = match one_shot_index(&mut store, &*embedder, &root, &spec) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("service: {} initial sync failed: {e}", root.display());
+            return;
+        }
+    };
+
+    let mut path_to_ids = build_path_to_ids(&store);
+    let mut all_ids: HashSet<String> = path_to_ids.values().flatten().cloned().collect();
+
+    eprintln!(
+        "service: {} synced files={} chunks={}",
+        root.display(),
+        stats.files,
+        all_ids.len()
+    );
+
+    // Live loop: process batches until the channel closes (Stop).
+    while let Ok(batch) = rx.recv() {
+        // `process_changes` prints its own `daemon: live update …` line.
+        process_changes(
+            &mut store,
+            &*embedder,
+            &root,
+            &batch,
+            &mut path_to_ids,
+            &mut all_ids,
+        );
+    }
+
+    eprintln!("service: {} stopped", root.display());
+}
+
+// ---------------------------------------------------------------------------
+// Reconciliation
+// ---------------------------------------------------------------------------
+
+/// Bring the running actor set in line with the registry's desired roots.
+///
+/// Keys everything by CANONICAL path (`scan()` already returns canonical roots).
+/// The `contains_key` guard guarantees we never spawn two actors for one root.
+fn reconcile<W: Watcher>(
+    reg: &Registry,
+    embedder: &Arc<LazyEmbedder>,
+    watcher: &mut W,
+    actors: &mut HashMap<PathBuf, Actor>,
+    specs: &mut HashMap<PathBuf, Ignore>,
+) -> Result<()> {
+    let desired = reg.scan()?;
+    let current: HashSet<PathBuf> = actors.keys().cloned().collect();
+    let (to_start, to_stop) = reconcile_diff(&desired, &current);
+
+    for root in to_stop {
+        if let Some(actor) = actors.remove(&root) {
+            let Actor { tx, join } = actor;
+            drop(tx); // close channel → actor drains + exits
+            let _ = join.join();
+        }
+        specs.remove(&root);
+        let _ = watcher.unwatch(&root);
+        eprintln!("service: unwatch {}", root.display());
+    }
+
+    for root in to_start {
+        // Dedupe guard (canonical key) — THE race hazard mitigation.
+        if actors.contains_key(&root) {
+            continue;
+        }
+        specs.insert(root.clone(), load_ignore(&root));
+
+        let (tx, actor_rx) = channel::<Vec<(Evt, PathBuf)>>();
+        let emb = Arc::clone(embedder);
+        let root_thread = root.clone();
+        let join = thread::spawn(move || actor_loop(root_thread, emb, actor_rx));
+        actors.insert(root.clone(), Actor { tx, join });
+
+        if let Err(e) = watcher.watch(&root, RecursiveMode::Recursive) {
+            eprintln!("service: failed to watch {}: {e}", root.display());
+        } else {
+            eprintln!("service: watch {}", root.display());
+        }
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Service entry point
+// ---------------------------------------------------------------------------
+
+/// Run the shared always-on service. Returns the process exit code.
+pub fn run_serve() -> Result<i32> {
+    let reg = Registry::from_env();
+
+    // Singleton guard — hold the lock for the whole function.
+    let _lock = match reg.acquire_serve_lock()? {
+        None => {
+            eprintln!("index-repo: serve already running");
+            return Ok(0);
+        }
+        Some(f) => f,
+    };
+
+    // Shared lazy embedder — model stays unloaded until the first real embed.
+    let embedder = Arc::new(LazyEmbedder::new());
+
+    // Signal handlers → stop flag.
+    let stop = Arc::new(AtomicBool::new(false));
+    for sig in [
+        signal_hook::consts::SIGTERM,
+        signal_hook::consts::SIGINT,
+        signal_hook::consts::SIGHUP,
+    ] {
+        let _ = signal_hook::flag::register(sig, Arc::clone(&stop));
+    }
+
+    // One debouncer for all roots; its receiver merges every watched tree.
+    let (tx, rx) = channel();
+    let mut debouncer = match new_debouncer(Duration::from_millis(DEBOUNCE_MS), None, tx) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("service: watch loop crashed ({e})");
+            return Ok(4);
+        }
+    };
+
+    // Watch the registry dir (NonRecursive) to observe register/unregister.
+    let roots_dir = reg.roots_dir();
+    let _ = std::fs::create_dir_all(&roots_dir);
+    if let Err(e) = debouncer
+        .watcher()
+        .watch(&roots_dir, RecursiveMode::NonRecursive)
+    {
+        eprintln!(
+            "service: failed to watch registry dir {}: {e}",
+            roots_dir.display()
+        );
+    }
+
+    let mut actors: HashMap<PathBuf, Actor> = HashMap::new();
+    let mut specs: HashMap<PathBuf, Ignore> = HashMap::new();
+
+    // Initial reconcile: start + watch an actor per desired root.
+    reconcile(
+        &reg,
+        &embedder,
+        debouncer.watcher(),
+        &mut actors,
+        &mut specs,
+    )?;
+    eprintln!("service: watching (roots={})", actors.len());
+
+    let mut last_gc = Instant::now();
+
+    let exit_code = loop {
+        if stop.load(Ordering::Relaxed) {
+            break 0;
+        }
+
+        // Periodic GC / reconcile sweep (reaps dead-pid roots, stops their actors).
+        if last_gc.elapsed() >= GC_INTERVAL {
+            reconcile(
+                &reg,
+                &embedder,
+                debouncer.watcher(),
+                &mut actors,
+                &mut specs,
+            )?;
+            last_gc = Instant::now();
+        }
+
+        match rx.recv_timeout(Duration::from_millis(200)) {
+            Ok(Ok(events)) => {
+                let mut registry_changed = false;
+                let mut groups: HashMap<PathBuf, Vec<(Evt, PathBuf)>> = HashMap::new();
+                let active_roots: Vec<PathBuf> = actors.keys().cloned().collect();
+
+                for ev in &events {
+                    let kind = ev.kind;
+                    for path in &ev.paths {
+                        // Registry change → reconcile (handled after grouping).
+                        if path.starts_with(&roots_dir) {
+                            registry_changed = true;
+                            continue;
+                        }
+                        // Route to owning root by longest-prefix match.
+                        let Some(root) = route(path, &active_roots) else {
+                            continue;
+                        };
+                        let Some(spec) = specs.get(root) else {
+                            continue;
+                        };
+                        if !watch_keep(root, spec, path) {
+                            continue;
+                        }
+                        let Some(evt) = evt_for(&kind) else {
+                            continue;
+                        };
+                        groups
+                            .entry(root.clone())
+                            .or_default()
+                            .push((evt, path.clone()));
+                    }
+                }
+
+                if registry_changed {
+                    reconcile(
+                        &reg,
+                        &embedder,
+                        debouncer.watcher(),
+                        &mut actors,
+                        &mut specs,
+                    )?;
+                    last_gc = Instant::now();
+                }
+
+                for (root, batch) in groups {
+                    if let Some(actor) = actors.get(&root) {
+                        let _ = actor.tx.send(batch);
+                    }
+                }
+            }
+            Ok(Err(errors)) => {
+                for e in errors {
+                    eprintln!("service: watch loop crashed ({e})");
+                }
+                break 4;
+            }
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => break 0,
+        }
+    };
+
+    // Stop all actors: unwatch, close channels, join.
+    for (root, actor) in actors.drain() {
+        let _ = debouncer.watcher().unwatch(&root);
+        let Actor { tx, join } = actor;
+        drop(tx);
+        let _ = join.join();
+    }
+
+    eprintln!("service: stopped");
+    Ok(exit_code)
+}
+
+// ---------------------------------------------------------------------------
+// Tests (pure helpers only)
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn route_picks_deepest_nested_root() {
+        let roots = vec![PathBuf::from("/a"), PathBuf::from("/a/b")];
+        assert_eq!(
+            route(Path::new("/a/b/c.rs"), &roots),
+            Some(&PathBuf::from("/a/b")),
+            "deepest root must win"
+        );
+        assert_eq!(
+            route(Path::new("/a/x.rs"), &roots),
+            Some(&PathBuf::from("/a")),
+            "shallow file routes to /a"
+        );
+    }
+
+    #[test]
+    fn route_none_when_unrelated() {
+        let roots = vec![PathBuf::from("/a"), PathBuf::from("/a/b")];
+        assert_eq!(route(Path::new("/z/y.rs"), &roots), None);
+    }
+
+    #[test]
+    fn route_component_wise_no_false_prefix() {
+        // "/a/bb" must NOT match a file under "/a/b".
+        let roots = vec![PathBuf::from("/a/bb")];
+        assert_eq!(route(Path::new("/a/b/c.rs"), &roots), None);
+    }
+
+    #[test]
+    fn reconcile_diff_add_remove_noop() {
+        let mut current = HashSet::new();
+        current.insert(PathBuf::from("/a"));
+        current.insert(PathBuf::from("/b"));
+
+        let desired = vec![PathBuf::from("/b"), PathBuf::from("/c")];
+        let (start, stop) = reconcile_diff(&desired, &current);
+
+        assert_eq!(start, vec![PathBuf::from("/c")], "/c is new");
+        assert_eq!(stop, vec![PathBuf::from("/a")], "/a is gone");
+        // /b is the no-op (present in both) — appears in neither list.
+    }
+
+    #[test]
+    fn reconcile_diff_empty_cases() {
+        let empty_current: HashSet<PathBuf> = HashSet::new();
+        let (start, stop) = reconcile_diff(&[PathBuf::from("/a")], &empty_current);
+        assert_eq!(start, vec![PathBuf::from("/a")]);
+        assert!(stop.is_empty());
+
+        let mut current = HashSet::new();
+        current.insert(PathBuf::from("/a"));
+        let (start, stop) = reconcile_diff(&[], &current);
+        assert!(start.is_empty());
+        assert_eq!(stop, vec![PathBuf::from("/a")]);
+    }
+}

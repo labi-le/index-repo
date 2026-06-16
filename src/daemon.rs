@@ -23,6 +23,18 @@ pub enum Evt {
     Upsert,
 }
 
+/// Map a notify `EventKind` to our `Evt`.
+///
+/// Remove → Delete, Create/Modify → Upsert, everything else (Access/Other/Any) → None.
+/// Extracted from `run_daemon` so the service dispatcher reuses identical mapping.
+pub fn evt_for(kind: &EventKind) -> Option<Evt> {
+    match kind {
+        EventKind::Remove(_) => Some(Evt::Delete),
+        EventKind::Create(_) | EventKind::Modify(_) => Some(Evt::Upsert),
+        _ => None,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // _safe: run a store Result, swallow on Err with exact spec §10.4 message
 // ---------------------------------------------------------------------------
@@ -297,11 +309,7 @@ pub fn run_daemon(
                     .flat_map(|debounced_event| {
                         let kind = debounced_event.kind;
                         debounced_event.paths.iter().filter_map(move |path| {
-                            let evt = match kind {
-                                EventKind::Remove(_) => Evt::Delete,
-                                EventKind::Create(_) | EventKind::Modify(_) => Evt::Upsert,
-                                _ => return None, // Access, Other, Any — ignore
-                            };
+                            let evt = evt_for(&kind)?; // Access/Other/Any → ignore
                             if watch_keep(root, spec, path) {
                                 Some((evt, path.clone()))
                             } else {
@@ -540,6 +548,29 @@ mod tests {
             all_ids.is_empty(),
             "all_ids should be empty after delete wins"
         );
+    }
+
+    // ---- evt_for ----
+
+    #[test]
+    fn evt_for_mapping_unchanged() {
+        use notify_debouncer_full::notify::event::{CreateKind, ModifyKind, RemoveKind};
+        assert!(matches!(
+            evt_for(&EventKind::Remove(RemoveKind::File)),
+            Some(Evt::Delete)
+        ));
+        assert!(matches!(
+            evt_for(&EventKind::Create(CreateKind::File)),
+            Some(Evt::Upsert)
+        ));
+        assert!(matches!(
+            evt_for(&EventKind::Modify(ModifyKind::Any)),
+            Some(Evt::Upsert)
+        ));
+        assert!(evt_for(&EventKind::Access(
+            notify_debouncer_full::notify::event::AccessKind::Any
+        ))
+        .is_none());
     }
 
     // ---- watch_keep ----

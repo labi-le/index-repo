@@ -1,15 +1,50 @@
-use clap::Parser;
+use clap::{Args, Parser, Subcommand};
+use index_repo::registry::Registry;
+use index_repo::service;
 use index_repo::store::Store as _;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 // ---------------------------------------------------------------------------
-// CLI arguments (spec §10.1 / Python parse_args)
+// CLI surface — subcommands + backward-compatible flat (legacy) args
 // ---------------------------------------------------------------------------
 
 #[derive(Parser, Debug)]
-#[command(about = "Semantic code indexer for ChromaDB using tree-sitter AST parsing.")]
-pub struct Args {
+#[command(
+    about = "Semantic code indexer for ChromaDB using tree-sitter AST parsing.",
+    args_conflicts_with_subcommands = true,
+    subcommand_negates_reqs = true
+)]
+struct Cli {
+    #[command(subcommand)]
+    command: Option<Command>,
+
+    #[command(flatten)]
+    legacy: LegacyArgs,
+}
+
+#[derive(Subcommand, Debug)]
+enum Command {
+    /// Run the shared always-on service (single shared model, all active roots).
+    Serve,
+    /// Register a repo root with the running service.
+    Register {
+        path: String,
+        #[arg(long)]
+        pid: Option<u32>,
+    },
+    /// Unregister a repo root.
+    Unregister {
+        path: String,
+        #[arg(long)]
+        pid: Option<u32>,
+    },
+}
+
+/// The original flat CLI (one-shot / `--daemon`), preserved verbatim for parity
+/// and manual use.
+#[derive(Args, Debug)]
+struct LegacyArgs {
     /// Project directory to index (default: current directory)
     #[arg(default_value = ".")]
     pub path: String,
@@ -48,8 +83,26 @@ pub struct Args {
 // ---------------------------------------------------------------------------
 
 fn main() -> ExitCode {
-    let args = Args::parse();
-    match run(args) {
+    let cli = Cli::parse();
+
+    let result: anyhow::Result<ExitCode> = match cli.command {
+        Some(Command::Serve) => service::run_serve().map(|c| ExitCode::from(c as u8)),
+        Some(Command::Register { path, pid }) => {
+            let pid = pid.unwrap_or_else(std::process::id);
+            Registry::from_env()
+                .register(Path::new(&path), pid)
+                .map(|()| ExitCode::SUCCESS)
+        }
+        Some(Command::Unregister { path, pid }) => {
+            let pid = pid.unwrap_or_else(std::process::id);
+            Registry::from_env()
+                .unregister(Path::new(&path), pid)
+                .map(|()| ExitCode::SUCCESS)
+        }
+        None => legacy_run(cli.legacy),
+    };
+
+    match result {
         Ok(code) => code,
         Err(e) => {
             eprintln!("error: {e:#}");
@@ -59,10 +112,10 @@ fn main() -> ExitCode {
 }
 
 // ---------------------------------------------------------------------------
-// Inner run — returns Result so `?` propagates unexpected errors cleanly
+// Legacy one-shot / --daemon path (today's `run()` body, verbatim logic)
 // ---------------------------------------------------------------------------
 
-fn run(args: Args) -> anyhow::Result<ExitCode> {
+fn legacy_run(args: LegacyArgs) -> anyhow::Result<ExitCode> {
     // Step 1: resolve root path; use canonicalize, fall back to absolute.
     // Python: root = Path(args.path).resolve()
     let root: PathBuf = std::fs::canonicalize(&args.path).unwrap_or_else(|_| {
@@ -178,7 +231,9 @@ mod tests {
 
     #[test]
     fn defaults() {
-        let a = Args::parse_from(["index-repo"]);
+        let cli = Cli::parse_from(["index-repo"]);
+        assert!(cli.command.is_none());
+        let a = cli.legacy;
         assert_eq!(a.host, "192.168.1.2");
         assert_eq!(a.port, 8000);
         assert_eq!(a.debounce, 800);
@@ -191,7 +246,7 @@ mod tests {
 
     #[test]
     fn all_flags_parsed() {
-        let a = Args::parse_from([
+        let cli = Cli::parse_from([
             "index-repo",
             "/some/path",
             "--host",
@@ -206,6 +261,8 @@ mod tests {
             "--debounce",
             "400",
         ]);
+        assert!(cli.command.is_none());
+        let a = cli.legacy;
         assert_eq!(a.path, "/some/path");
         assert_eq!(a.host, "10.0.0.1");
         assert_eq!(a.port, 9000);
@@ -218,9 +275,9 @@ mod tests {
 
     #[test]
     fn not_a_dir_returns_code_2() {
-        // Drive the not-a-dir branch without any network call by calling run()
-        // with a path that is clearly not a directory.
-        let a = Args {
+        // Drive the not-a-dir branch without any network call by calling
+        // legacy_run() with a path that is clearly not a directory.
+        let a = LegacyArgs {
             path: "/tmp/this_path_definitely_does_not_exist_xyz_12345".to_string(),
             host: "127.0.0.1".to_string(),
             port: 9999,
@@ -230,7 +287,45 @@ mod tests {
             daemon: false,
             debounce: 800,
         };
-        let result = run(a).unwrap();
+        let result = legacy_run(a).unwrap();
         assert_eq!(result, ExitCode::from(2));
+    }
+
+    #[test]
+    fn serve_subcommand_parses() {
+        let cli = Cli::parse_from(["index-repo", "serve"]);
+        assert!(matches!(cli.command, Some(Command::Serve)));
+    }
+
+    #[test]
+    fn register_subcommand_parses_path_and_pid() {
+        let cli = Cli::parse_from(["index-repo", "register", "/x", "--pid", "42"]);
+        match cli.command {
+            Some(Command::Register { path, pid }) => {
+                assert_eq!(path, "/x");
+                assert_eq!(pid, Some(42));
+            }
+            other => panic!("expected Register, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unregister_subcommand_parses() {
+        let cli = Cli::parse_from(["index-repo", "unregister", "/y"]);
+        match cli.command {
+            Some(Command::Unregister { path, pid }) => {
+                assert_eq!(path, "/y");
+                assert_eq!(pid, None);
+            }
+            other => panic!("expected Unregister, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bare_args_still_parse_as_legacy() {
+        let cli = Cli::parse_from(["index-repo", "/some/path", "--daemon"]);
+        assert!(cli.command.is_none());
+        assert_eq!(cli.legacy.path, "/some/path");
+        assert!(cli.legacy.daemon);
     }
 }

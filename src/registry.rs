@@ -25,7 +25,8 @@ impl Registry {
         Self { base: base.into() }
     }
 
-    fn roots_dir(&self) -> PathBuf {
+    /// Directory holding the per-(root, pid) marker files: `<base>/roots`.
+    pub fn roots_dir(&self) -> PathBuf {
         self.base.join("roots")
     }
 
