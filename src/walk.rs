@@ -10,6 +10,13 @@ use walkdir::WalkDir;
 /// Wrapper so callers don't need to import `ignore` directly.
 pub struct Ignore(Gitignore);
 
+impl Ignore {
+    /// Return true if `rel` (POSIX path relative to root) is ignored.
+    pub(crate) fn is_ignored(&self, rel: &Path) -> bool {
+        self.0.matched_path_or_any_parents(rel, false).is_ignore()
+    }
+}
+
 /// Build one matcher from `EXTRA_IGNORE` + root `.gitignore` (spec §5.1).
 ///
 /// Patterns are added via `add_line(None, pat)` with gitwildmatch semantics,
