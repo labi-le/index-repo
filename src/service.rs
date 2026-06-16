@@ -53,6 +53,15 @@ pub fn route<'a>(path: &Path, roots: &'a [PathBuf]) -> Option<&'a PathBuf> {
         .max_by_key(|r| r.components().count())
 }
 
+/// All roots that are path-prefix ancestors of `path` (component-wise).
+///
+/// Unlike [`route`], this returns EVERY matching root so an edit under a
+/// nested layout (`/repo` and `/repo/sub` both registered) updates each
+/// owning collection, not just the deepest one.
+pub fn route_all<'a>(path: &Path, roots: &'a [PathBuf]) -> Vec<&'a PathBuf> {
+    roots.iter().filter(|r| path.starts_with(r)).collect()
+}
+
 /// Compute `(to_start, to_stop)` between the desired root set and the currently
 /// running set. `to_start` preserves `desired` order; `to_stop` is the current
 /// roots no longer desired.
@@ -153,7 +162,27 @@ fn reconcile<W: Watcher>(
     watcher: &mut W,
     actors: &mut HashMap<PathBuf, Actor>,
     specs: &mut HashMap<PathBuf, Ignore>,
+    reaper: &mut Vec<JoinHandle<()>>,
 ) -> Result<()> {
+    // FIX 2: prune dead (early-exited) actors before diffing so that a root
+    // whose actor returned early (e.g. ChromaDB down at registration) is
+    // absent from `current` and lands in `to_start` → respawned (≤GC backoff).
+    let dead: Vec<PathBuf> = actors
+        .iter()
+        .filter(|(_, a)| a.join.is_finished())
+        .map(|(r, _)| r.clone())
+        .collect();
+    for root in dead {
+        if let Some(actor) = actors.remove(&root) {
+            let Actor { tx, join } = actor;
+            drop(tx);
+            reaper.push(join); // already finished — join won't block, defer anyway
+        }
+        specs.remove(&root);
+        let _ = watcher.unwatch(&root);
+        eprintln!("service: pruned dead actor {}", root.display());
+    }
+
     let desired = reg.scan()?;
     let current: HashSet<PathBuf> = actors.keys().cloned().collect();
     let (to_start, to_stop) = reconcile_diff(&desired, &current);
@@ -162,7 +191,9 @@ fn reconcile<W: Watcher>(
         if let Some(actor) = actors.remove(&root) {
             let Actor { tx, join } = actor;
             drop(tx); // close channel → actor drains + exits
-            let _ = join.join();
+                      // FIX 1: do NOT join here — a mid-embed / slow-HTTP actor would
+                      // stall the dispatcher. Defer to the reaper, drained off-loop.
+            reaper.push(join);
         }
         specs.remove(&root);
         let _ = watcher.unwatch(&root);
@@ -247,6 +278,8 @@ pub fn run_serve() -> Result<i32> {
 
     let mut actors: HashMap<PathBuf, Actor> = HashMap::new();
     let mut specs: HashMap<PathBuf, Ignore> = HashMap::new();
+    // Stopped-actor join handles, drained off the dispatcher loop (FIX 1).
+    let mut reaper: Vec<JoinHandle<()>> = Vec::new();
 
     // Initial reconcile: start + watch an actor per desired root.
     reconcile(
@@ -255,6 +288,7 @@ pub fn run_serve() -> Result<i32> {
         debouncer.watcher(),
         &mut actors,
         &mut specs,
+        &mut reaper,
     )?;
     eprintln!("service: watching (roots={})", actors.len());
 
@@ -265,15 +299,21 @@ pub fn run_serve() -> Result<i32> {
             break 0;
         }
 
+        // Reap any finished stopped-actor handles without blocking (FIX 1).
+        reaper.retain(|h| !h.is_finished());
+
         // Periodic GC / reconcile sweep (reaps dead-pid roots, stops their actors).
         if last_gc.elapsed() >= GC_INTERVAL {
-            reconcile(
+            if let Err(e) = reconcile(
                 &reg,
                 &embedder,
                 debouncer.watcher(),
                 &mut actors,
                 &mut specs,
-            )?;
+                &mut reaper,
+            ) {
+                eprintln!("service: reconcile failed ({e})");
+            }
             last_gc = Instant::now();
         }
 
@@ -291,34 +331,39 @@ pub fn run_serve() -> Result<i32> {
                             registry_changed = true;
                             continue;
                         }
-                        // Route to owning root by longest-prefix match.
-                        let Some(root) = route(path, &active_roots) else {
-                            continue;
-                        };
-                        let Some(spec) = specs.get(root) else {
-                            continue;
-                        };
-                        if !watch_keep(root, spec, path) {
-                            continue;
+                        // FIX 3: route to EVERY ancestor root, not just the
+                        // deepest, so nested roots both stay current.
+                        for root in route_all(path, &active_roots) {
+                            // Each root has its own ignore spec.
+                            let Some(spec) = specs.get(root) else {
+                                continue;
+                            };
+                            if !watch_keep(root, spec, path) {
+                                continue;
+                            }
+                            // `Evt` is not `Clone`; rebuild per root from kind.
+                            let Some(evt) = evt_for(&kind) else {
+                                continue;
+                            };
+                            groups
+                                .entry(root.clone())
+                                .or_default()
+                                .push((evt, path.clone()));
                         }
-                        let Some(evt) = evt_for(&kind) else {
-                            continue;
-                        };
-                        groups
-                            .entry(root.clone())
-                            .or_default()
-                            .push((evt, path.clone()));
                     }
                 }
 
                 if registry_changed {
-                    reconcile(
+                    if let Err(e) = reconcile(
                         &reg,
                         &embedder,
                         debouncer.watcher(),
                         &mut actors,
                         &mut specs,
-                    )?;
+                        &mut reaper,
+                    ) {
+                        eprintln!("service: reconcile failed ({e})");
+                    }
                     last_gc = Instant::now();
                 }
 
@@ -329,21 +374,27 @@ pub fn run_serve() -> Result<i32> {
                 }
             }
             Ok(Err(errors)) => {
+                // FIX 4: a transient notify error must not tear down all roots.
                 for e in errors {
-                    eprintln!("service: watch loop crashed ({e})");
+                    eprintln!("service: watch error ({e})");
                 }
-                break 4;
+                continue;
             }
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => break 0,
         }
     };
 
-    // Stop all actors: unwatch, close channels, join.
+    // Stop all actors: unwatch, close channels, join. Synchronous join at
+    // shutdown is fine — we are tearing down.
     for (root, actor) in actors.drain() {
         let _ = debouncer.watcher().unwatch(&root);
         let Actor { tx, join } = actor;
         drop(tx);
+        let _ = join.join();
+    }
+    // Join any previously-deferred (stopped) actor handles (FIX 1).
+    for join in reaper.drain(..) {
         let _ = join.join();
     }
 
@@ -378,6 +429,30 @@ mod tests {
     fn route_none_when_unrelated() {
         let roots = vec![PathBuf::from("/a"), PathBuf::from("/a/b")];
         assert_eq!(route(Path::new("/z/y.rs"), &roots), None);
+    }
+
+    #[test]
+    fn route_all_returns_every_ancestor() {
+        let roots = vec![PathBuf::from("/repo"), PathBuf::from("/repo/sub")];
+        // Nested case: a file under /repo/sub belongs to BOTH roots.
+        let mut got = route_all(Path::new("/repo/sub/x.rs"), &roots);
+        got.sort();
+        assert_eq!(
+            got,
+            vec![&PathBuf::from("/repo"), &PathBuf::from("/repo/sub")],
+            "nested file must route to both ancestors"
+        );
+
+        // Disjoint/normal case: exactly one matching root.
+        let disjoint = vec![PathBuf::from("/a"), PathBuf::from("/b")];
+        assert_eq!(
+            route_all(Path::new("/a/x.rs"), &disjoint),
+            vec![&PathBuf::from("/a")],
+            "disjoint file routes to exactly one root"
+        );
+
+        // No match.
+        assert!(route_all(Path::new("/z/y.rs"), &roots).is_empty());
     }
 
     #[test]
