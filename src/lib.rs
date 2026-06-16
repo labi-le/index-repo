@@ -1,3 +1,4 @@
+pub mod chroma;
 pub mod chunk;
 pub mod chunkfile;
 pub mod config;
