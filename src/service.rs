@@ -25,16 +25,15 @@ use crate::registry::Registry;
 use crate::store::Store;
 use crate::walk::{load_ignore, Ignore};
 
-// ChromaDB connection defaults (same as the legacy CLI defaults).
-const CHROMA_HOST: &str = "192.168.1.2";
-const CHROMA_PORT: u16 = 8000;
-const CHROMA_SSL: bool = false;
-
-// Debounce window for the shared watcher (ms).
-const DEBOUNCE_MS: u64 = 800;
-
 // Periodic GC / reconcile sweep interval.
 const GC_INTERVAL: Duration = Duration::from_secs(30);
+
+#[derive(Clone)]
+struct Conn {
+    host: String,
+    port: u16,
+    ssl: bool,
+}
 
 // ---------------------------------------------------------------------------
 // Pure helpers (unit-tested below — no threads / fs / network)
@@ -97,7 +96,12 @@ struct Actor {
 
 /// Per-root actor thread body. Owns its `HttpStore`, `path_to_ids`, `all_ids`.
 /// Runs the initial `one_shot_index`, then serially applies batches.
-fn actor_loop(root: PathBuf, embedder: Arc<LazyEmbedder>, rx: Receiver<Vec<(Evt, PathBuf)>>) {
+fn actor_loop(
+    root: PathBuf,
+    conn: Conn,
+    embedder: Arc<LazyEmbedder>,
+    rx: Receiver<Vec<(Evt, PathBuf)>>,
+) {
     let collection = format!(
         "code-{}",
         root.file_name()
@@ -105,7 +109,7 @@ fn actor_loop(root: PathBuf, embedder: Arc<LazyEmbedder>, rx: Receiver<Vec<(Evt,
             .unwrap_or("unknown")
     );
 
-    let mut store = HttpStore::new(CHROMA_HOST, CHROMA_PORT, CHROMA_SSL);
+    let mut store = HttpStore::new(&conn.host, conn.port, conn.ssl);
     if let Err(e) = store.get_or_create(&collection) {
         eprintln!("service: {} get_or_create failed: {e}", root.display());
         return;
@@ -158,6 +162,7 @@ fn actor_loop(root: PathBuf, embedder: Arc<LazyEmbedder>, rx: Receiver<Vec<(Evt,
 /// The `contains_key` guard guarantees we never spawn two actors for one root.
 fn reconcile<W: Watcher>(
     reg: &Registry,
+    conn: &Conn,
     embedder: &Arc<LazyEmbedder>,
     watcher: &mut W,
     actors: &mut HashMap<PathBuf, Actor>,
@@ -210,7 +215,8 @@ fn reconcile<W: Watcher>(
         let (tx, actor_rx) = channel::<Vec<(Evt, PathBuf)>>();
         let emb = Arc::clone(embedder);
         let root_thread = root.clone();
-        let join = thread::spawn(move || actor_loop(root_thread, emb, actor_rx));
+        let conn_thread = conn.clone();
+        let join = thread::spawn(move || actor_loop(root_thread, conn_thread, emb, actor_rx));
         actors.insert(root.clone(), Actor { tx, join });
 
         if let Err(e) = watcher.watch(&root, RecursiveMode::Recursive) {
@@ -228,8 +234,13 @@ fn reconcile<W: Watcher>(
 // ---------------------------------------------------------------------------
 
 /// Run the shared always-on service. Returns the process exit code.
-pub fn run_serve() -> Result<i32> {
+pub fn run_serve(host: &str, port: u16, ssl: bool, debounce_ms: u64) -> Result<i32> {
     let reg = Registry::from_env();
+    let conn = Conn {
+        host: host.to_string(),
+        port,
+        ssl,
+    };
 
     // Singleton guard — hold the lock for the whole function.
     let _lock = match reg.acquire_serve_lock()? {
@@ -255,7 +266,7 @@ pub fn run_serve() -> Result<i32> {
 
     // One debouncer for all roots; its receiver merges every watched tree.
     let (tx, rx) = channel();
-    let mut debouncer = match new_debouncer(Duration::from_millis(DEBOUNCE_MS), None, tx) {
+    let mut debouncer = match new_debouncer(Duration::from_millis(debounce_ms), None, tx) {
         Ok(d) => d,
         Err(e) => {
             eprintln!("service: watch loop crashed ({e})");
@@ -284,6 +295,7 @@ pub fn run_serve() -> Result<i32> {
     // Initial reconcile: start + watch an actor per desired root.
     reconcile(
         &reg,
+        &conn,
         &embedder,
         debouncer.watcher(),
         &mut actors,
@@ -306,6 +318,7 @@ pub fn run_serve() -> Result<i32> {
         if last_gc.elapsed() >= GC_INTERVAL {
             if let Err(e) = reconcile(
                 &reg,
+                &conn,
                 &embedder,
                 debouncer.watcher(),
                 &mut actors,
@@ -356,6 +369,7 @@ pub fn run_serve() -> Result<i32> {
                 if registry_changed {
                     if let Err(e) = reconcile(
                         &reg,
+                        &conn,
                         &embedder,
                         debouncer.watcher(),
                         &mut actors,

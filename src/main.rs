@@ -26,7 +26,20 @@ struct Cli {
 #[derive(Subcommand, Debug)]
 enum Command {
     /// Run the shared always-on service (single shared model, all active roots).
-    Serve,
+    Serve {
+        /// ChromaDB host
+        #[arg(long, default_value = "192.168.1.2")]
+        host: String,
+        /// ChromaDB port
+        #[arg(long, default_value_t = 8000)]
+        port: u16,
+        /// Use HTTPS
+        #[arg(long, default_value_t = false)]
+        ssl: bool,
+        /// Fs-event debounce window in ms
+        #[arg(long, default_value_t = 800)]
+        debounce: u64,
+    },
     /// Register a repo root with the running service.
     Register {
         path: String,
@@ -86,7 +99,12 @@ fn main() -> ExitCode {
     let cli = Cli::parse();
 
     let result: anyhow::Result<ExitCode> = match cli.command {
-        Some(Command::Serve) => service::run_serve().map(|c| ExitCode::from(c as u8)),
+        Some(Command::Serve {
+            host,
+            port,
+            ssl,
+            debounce,
+        }) => service::run_serve(&host, port, ssl, debounce).map(|c| ExitCode::from(c as u8)),
         Some(Command::Register { path, pid }) => {
             let pid = pid.unwrap_or_else(std::process::id);
             Registry::from_env()
@@ -292,9 +310,51 @@ mod tests {
     }
 
     #[test]
-    fn serve_subcommand_parses() {
+    fn serve_subcommand_parses_with_defaults() {
         let cli = Cli::parse_from(["index-repo", "serve"]);
-        assert!(matches!(cli.command, Some(Command::Serve)));
+        match cli.command {
+            Some(Command::Serve {
+                host,
+                port,
+                ssl,
+                debounce,
+            }) => {
+                assert_eq!(host, "192.168.1.2");
+                assert_eq!(port, 8000);
+                assert!(!ssl);
+                assert_eq!(debounce, 800);
+            }
+            other => panic!("expected Serve, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn serve_subcommand_parses_options() {
+        let cli = Cli::parse_from([
+            "index-repo",
+            "serve",
+            "--host",
+            "10.0.0.5",
+            "--port",
+            "9000",
+            "--ssl",
+            "--debounce",
+            "200",
+        ]);
+        match cli.command {
+            Some(Command::Serve {
+                host,
+                port,
+                ssl,
+                debounce,
+            }) => {
+                assert_eq!(host, "10.0.0.5");
+                assert_eq!(port, 9000);
+                assert!(ssl);
+                assert_eq!(debounce, 200);
+            }
+            other => panic!("expected Serve, got {other:?}"),
+        }
     }
 
     #[test]

@@ -9,10 +9,9 @@ fn parity() {
         return;
     }
 
-    let corpus = std::env::var("PARITY_CORPUS")
-        .unwrap_or_else(|_| "tests/fixtures".to_string());
-    let index_bin = std::env::var("INDEX_REPO_BIN")
-        .unwrap_or_else(|_| "./result/bin/index-repo".to_string());
+    let corpus = std::env::var("PARITY_CORPUS").unwrap_or_else(|_| "tests/fixtures".to_string());
+    let index_bin =
+        std::env::var("INDEX_REPO_BIN").unwrap_or_else(|_| "./result/bin/index-repo".to_string());
     let py_indexer = std::env::var("PYTHON_INDEXER").unwrap_or_else(|_| {
         "/home/labile/nixos/home-manager/modules/opencode/scripts/index_repo.py".to_string()
     });
@@ -67,10 +66,7 @@ fn parity() {
         ])
         .status()
         .expect("failed to spawn Rust indexer");
-    assert!(
-        rs_status.success(),
-        "Rust indexer failed with {rs_status}"
-    );
+    assert!(rs_status.success(), "Rust indexer failed with {rs_status}");
 
     // ---- Run compare.py ----
     eprintln!("parity: running compare.py...");
