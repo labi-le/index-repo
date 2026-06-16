@@ -13,7 +13,7 @@ in
   options.services.index-repo = {
     package = lib.mkOption {
       type = lib.types.package;
-      default = self.packages.${pkgs.system}.default;
+      default = self.packages.${pkgs.stdenv.hostPlatform.system}.default;
       defaultText = lib.literalExpression "index-repo.packages.\${system}.default";
       description = "The index-repo package providing the register/unregister CLI.";
     };

@@ -15,7 +15,7 @@ in
 
     package = lib.mkOption {
       type = lib.types.package;
-      default = self.packages.${pkgs.system}.default;
+      default = self.packages.${pkgs.stdenv.hostPlatform.system}.default;
       defaultText = lib.literalExpression "index-repo.packages.\${system}.default";
       description = "The index-repo package to run (already wrapped with ORT_DYLIB_PATH + INDEX_REPO_MODEL_DIR).";
     };
