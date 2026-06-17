@@ -11,8 +11,8 @@ use std::sync::{Mutex, Once};
 
 static ORT_INIT: Once = Once::new();
 
-// Bounds the retained ort CPU arena (~8 GB at default all-cores/batch-256 on a
-// large index). Both are parity-safe: neither changes embedding values.
+// Cap the per-batch transient peak. The arena itself is disabled below, so
+// these just bound a single batch's scratch. Parity-safe: values unchanged.
 const INTRA_THREADS: usize = 4;
 const EMBED_BATCH: usize = 32;
 
@@ -75,9 +75,16 @@ impl Embedder {
         let model_def =
             UserDefinedEmbeddingModel::new(onnx_bytes, tokenizer_files).with_pooling(Pooling::Mean); // all-MiniLM-L6-v2: mean-pool + L2-norm
 
+        // CPU::with_arena_allocator(false) → DisableCpuMemArena: scratch is
+        // freed after each inference instead of pooled and retained for the
+        // session's life (the ~8 GB resident growth). Values are unaffected.
         let te = TextEmbedding::try_new_from_user_defined(
             model_def,
-            InitOptionsUserDefined::default().with_intra_threads(INTRA_THREADS),
+            InitOptionsUserDefined::default()
+                .with_intra_threads(INTRA_THREADS)
+                .with_execution_providers(vec![ort::ep::CPU::default()
+                    .with_arena_allocator(false)
+                    .build()]),
         )?;
 
         Ok(Self {
