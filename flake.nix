@@ -51,7 +51,7 @@
 
         src = pkgs.fetchurl {
           url = "https://github.com/labi-le/index-repo/releases/download/v${version}/index-repo_linux_amd64";
-          hash = "sha256-jCrMTVZNhLVPR0KybTFu/bo7BQzzMEot9Pf8PpJpd48="; # x86_64-linux
+          hash = "sha256-OqIuovcp4PiY6gt+Wi9IyNwiOp4G3AfLe6anJQhDISU="; # x86_64-linux
         };
 
         dontUnpack = true;
