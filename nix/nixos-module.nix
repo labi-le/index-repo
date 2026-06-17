@@ -60,6 +60,7 @@ in
       description = "Code indexer (shared singleton)";
       after = [ "basic.target" ];
       wantedBy = [ "default.target" ];
+      unitConfig.ConditionUser = "!@system";
       serviceConfig = {
         Type = "simple";
         ExecStart = lib.concatStringsSep " " (
