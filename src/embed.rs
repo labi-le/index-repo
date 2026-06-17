@@ -7,10 +7,11 @@ use std::sync::{Mutex, Once};
 
 static ORT_INIT: Once = Once::new();
 
-// Cap the per-batch transient peak. The arena itself is disabled below, so
-// these just bound a single batch's scratch. Parity-safe: values unchanged.
+// Must byte-match chromadb DefaultEmbeddingFunction (_forward batch=32,
+// enable_truncation=256) or vectors diverge from the chroma-mcp query path.
 const INTRA_THREADS: usize = 4;
 const EMBED_BATCH: usize = 32;
+const MAX_LENGTH: usize = 256;
 
 fn maybe_init_ort() {
     ORT_INIT.call_once(|| {
@@ -61,6 +62,7 @@ impl Embedder {
             model_def,
             InitOptionsUserDefined::default()
                 .with_intra_threads(INTRA_THREADS)
+                .with_max_length(MAX_LENGTH)
                 .with_execution_providers(vec![ort::ep::CPU::default()
                     .with_arena_allocator(false)
                     .build()]),
