@@ -8,7 +8,7 @@
       system = "x86_64-linux";
       pkgs = import nixpkgs { inherit system; };
 
-      version = "0.1.0";
+      version = "0.1.1";
       pname = "index-repo";
 
       # ---------------------------------------------------------------------------
