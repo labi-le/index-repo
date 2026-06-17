@@ -25,7 +25,6 @@ use crate::registry::Registry;
 use crate::store::Store;
 use crate::walk::{load_ignore, Ignore};
 
-// Periodic GC / reconcile sweep interval.
 const GC_INTERVAL: Duration = Duration::from_secs(30);
 
 #[derive(Clone)]
@@ -34,10 +33,6 @@ struct Conn {
     port: u16,
     ssl: bool,
 }
-
-// ---------------------------------------------------------------------------
-// Pure helpers (unit-tested below — no threads / fs / network)
-// ---------------------------------------------------------------------------
 
 /// Longest canonical-prefix match: return the deepest root that is a path
 /// prefix of `path`. `None` if `path` lives under no root.
@@ -82,10 +77,6 @@ pub fn reconcile_diff(
     (to_start, to_stop)
 }
 
-// ---------------------------------------------------------------------------
-// Per-root actor
-// ---------------------------------------------------------------------------
-
 /// Dispatcher-side handle to a per-root actor thread.
 struct Actor {
     /// Send a debounced batch of `(Evt, PathBuf)` to the actor. Dropping this
@@ -117,7 +108,6 @@ fn actor_loop(
 
     let spec = load_ignore(&root);
 
-    // Initial sync — same primitive the daemon uses.
     let stats = match one_shot_index(&mut store, &*embedder, &root, &spec) {
         Ok(s) => s,
         Err(e) => {
@@ -136,9 +126,7 @@ fn actor_loop(
         all_ids.len()
     );
 
-    // Live loop: process batches until the channel closes (Stop).
     while let Ok(batch) = rx.recv() {
-        // `process_changes` prints its own `daemon: live update …` line.
         process_changes(
             &mut store,
             &*embedder,
@@ -151,10 +139,6 @@ fn actor_loop(
 
     eprintln!("service: {} stopped", root.display());
 }
-
-// ---------------------------------------------------------------------------
-// Reconciliation
-// ---------------------------------------------------------------------------
 
 /// Bring the running actor set in line with the registry's desired roots.
 ///
@@ -169,9 +153,6 @@ fn reconcile<W: Watcher>(
     specs: &mut HashMap<PathBuf, Ignore>,
     reaper: &mut Vec<JoinHandle<()>>,
 ) -> Result<()> {
-    // FIX 2: prune dead (early-exited) actors before diffing so that a root
-    // whose actor returned early (e.g. ChromaDB down at registration) is
-    // absent from `current` and lands in `to_start` → respawned (≤GC backoff).
     let dead: Vec<PathBuf> = actors
         .iter()
         .filter(|(_, a)| a.join.is_finished())
@@ -181,7 +162,7 @@ fn reconcile<W: Watcher>(
         if let Some(actor) = actors.remove(&root) {
             let Actor { tx, join } = actor;
             drop(tx);
-            reaper.push(join); // already finished — join won't block, defer anyway
+            reaper.push(join);
         }
         specs.remove(&root);
         let _ = watcher.unwatch(&root);
@@ -195,9 +176,9 @@ fn reconcile<W: Watcher>(
     for root in to_stop {
         if let Some(actor) = actors.remove(&root) {
             let Actor { tx, join } = actor;
-            drop(tx); // close channel → actor drains + exits
-                      // FIX 1: do NOT join here — a mid-embed / slow-HTTP actor would
-                      // stall the dispatcher. Defer to the reaper, drained off-loop.
+            drop(tx);
+            // Defer the join to the reaper instead of joining here: a mid-embed
+            // or slow-HTTP actor would otherwise stall the whole dispatcher loop.
             reaper.push(join);
         }
         specs.remove(&root);
@@ -206,7 +187,8 @@ fn reconcile<W: Watcher>(
     }
 
     for root in to_start {
-        // Dedupe guard (canonical key) — THE race hazard mitigation.
+        // Dedupe guard (canonical key): without it a concurrent reconcile could
+        // spawn a second actor for a root that already has one — a race hazard.
         if actors.contains_key(&root) {
             continue;
         }
@@ -229,10 +211,6 @@ fn reconcile<W: Watcher>(
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// Service entry point
-// ---------------------------------------------------------------------------
-
 /// Run the shared always-on service. Returns the process exit code.
 pub fn run_serve(host: &str, port: u16, ssl: bool, debounce_ms: u64) -> Result<i32> {
     let reg = Registry::from_env();
@@ -242,7 +220,6 @@ pub fn run_serve(host: &str, port: u16, ssl: bool, debounce_ms: u64) -> Result<i
         ssl,
     };
 
-    // Singleton guard — hold the lock for the whole function.
     let _lock = match reg.acquire_serve_lock()? {
         None => {
             eprintln!("index-repo: serve already running");
@@ -251,10 +228,8 @@ pub fn run_serve(host: &str, port: u16, ssl: bool, debounce_ms: u64) -> Result<i
         Some(f) => f,
     };
 
-    // Shared lazy embedder — model stays unloaded until the first real embed.
     let embedder = Arc::new(LazyEmbedder::new());
 
-    // Signal handlers → stop flag.
     let stop = Arc::new(AtomicBool::new(false));
     for sig in [
         signal_hook::consts::SIGTERM,
@@ -264,7 +239,6 @@ pub fn run_serve(host: &str, port: u16, ssl: bool, debounce_ms: u64) -> Result<i
         let _ = signal_hook::flag::register(sig, Arc::clone(&stop));
     }
 
-    // One debouncer for all roots; its receiver merges every watched tree.
     let (tx, rx) = channel();
     let mut debouncer = match new_debouncer(Duration::from_millis(debounce_ms), None, tx) {
         Ok(d) => d,
@@ -274,7 +248,6 @@ pub fn run_serve(host: &str, port: u16, ssl: bool, debounce_ms: u64) -> Result<i
         }
     };
 
-    // Watch the registry dir (NonRecursive) to observe register/unregister.
     let roots_dir = reg.roots_dir();
     let _ = std::fs::create_dir_all(&roots_dir);
     if let Err(e) = debouncer
@@ -289,10 +262,8 @@ pub fn run_serve(host: &str, port: u16, ssl: bool, debounce_ms: u64) -> Result<i
 
     let mut actors: HashMap<PathBuf, Actor> = HashMap::new();
     let mut specs: HashMap<PathBuf, Ignore> = HashMap::new();
-    // Stopped-actor join handles, drained off the dispatcher loop (FIX 1).
     let mut reaper: Vec<JoinHandle<()>> = Vec::new();
 
-    // Initial reconcile: start + watch an actor per desired root.
     reconcile(
         &reg,
         &conn,
@@ -311,10 +282,8 @@ pub fn run_serve(host: &str, port: u16, ssl: bool, debounce_ms: u64) -> Result<i
             break 0;
         }
 
-        // Reap any finished stopped-actor handles without blocking (FIX 1).
         reaper.retain(|h| !h.is_finished());
 
-        // Periodic GC / reconcile sweep (reaps dead-pid roots, stops their actors).
         if last_gc.elapsed() >= GC_INTERVAL {
             if let Err(e) = reconcile(
                 &reg,
@@ -339,22 +308,17 @@ pub fn run_serve(host: &str, port: u16, ssl: bool, debounce_ms: u64) -> Result<i
                 for ev in &events {
                     let kind = ev.kind;
                     for path in &ev.paths {
-                        // Registry change → reconcile (handled after grouping).
                         if path.starts_with(&roots_dir) {
                             registry_changed = true;
                             continue;
                         }
-                        // FIX 3: route to EVERY ancestor root, not just the
-                        // deepest, so nested roots both stay current.
                         for root in route_all(path, &active_roots) {
-                            // Each root has its own ignore spec.
                             let Some(spec) = specs.get(root) else {
                                 continue;
                             };
                             if !watch_keep(root, spec, path) {
                                 continue;
                             }
-                            // `Evt` is not `Clone`; rebuild per root from kind.
                             let Some(evt) = evt_for(&kind) else {
                                 continue;
                             };
@@ -388,7 +352,6 @@ pub fn run_serve(host: &str, port: u16, ssl: bool, debounce_ms: u64) -> Result<i
                 }
             }
             Ok(Err(errors)) => {
-                // FIX 4: a transient notify error must not tear down all roots.
                 for e in errors {
                     eprintln!("service: watch error ({e})");
                 }
@@ -399,15 +362,12 @@ pub fn run_serve(host: &str, port: u16, ssl: bool, debounce_ms: u64) -> Result<i
         }
     };
 
-    // Stop all actors: unwatch, close channels, join. Synchronous join at
-    // shutdown is fine — we are tearing down.
     for (root, actor) in actors.drain() {
         let _ = debouncer.watcher().unwatch(&root);
         let Actor { tx, join } = actor;
         drop(tx);
         let _ = join.join();
     }
-    // Join any previously-deferred (stopped) actor handles (FIX 1).
     for join in reaper.drain(..) {
         let _ = join.join();
     }
@@ -415,10 +375,6 @@ pub fn run_serve(host: &str, port: u16, ssl: bool, debounce_ms: u64) -> Result<i
     eprintln!("service: stopped");
     Ok(exit_code)
 }
-
-// ---------------------------------------------------------------------------
-// Tests (pure helpers only)
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
@@ -448,7 +404,6 @@ mod tests {
     #[test]
     fn route_all_returns_every_ancestor() {
         let roots = vec![PathBuf::from("/repo"), PathBuf::from("/repo/sub")];
-        // Nested case: a file under /repo/sub belongs to BOTH roots.
         let mut got = route_all(Path::new("/repo/sub/x.rs"), &roots);
         got.sort();
         assert_eq!(
@@ -457,7 +412,6 @@ mod tests {
             "nested file must route to both ancestors"
         );
 
-        // Disjoint/normal case: exactly one matching root.
         let disjoint = vec![PathBuf::from("/a"), PathBuf::from("/b")];
         assert_eq!(
             route_all(Path::new("/a/x.rs"), &disjoint),
@@ -465,13 +419,11 @@ mod tests {
             "disjoint file routes to exactly one root"
         );
 
-        // No match.
         assert!(route_all(Path::new("/z/y.rs"), &roots).is_empty());
     }
 
     #[test]
     fn route_component_wise_no_false_prefix() {
-        // "/a/bb" must NOT match a file under "/a/b".
         let roots = vec![PathBuf::from("/a/bb")];
         assert_eq!(route(Path::new("/a/b/c.rs"), &roots), None);
     }
@@ -487,7 +439,6 @@ mod tests {
 
         assert_eq!(start, vec![PathBuf::from("/c")], "/c is new");
         assert_eq!(stop, vec![PathBuf::from("/a")], "/a is gone");
-        // /b is the no-op (present in both) — appears in neither list.
     }
 
     #[test]

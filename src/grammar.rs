@@ -2,13 +2,8 @@ use std::collections::BTreeSet;
 use std::sync::Mutex;
 use tree_sitter::Language;
 
-/// Global set of grammar keys actually used this run (for `grammars=` log).
 static USED_GRAMMARS: Mutex<BTreeSet<&'static str>> = Mutex::new(BTreeSet::new());
 
-/// Return the tree-sitter `Language` for a given lang key (per spec §2).
-///
-/// Records the key in `USED_GRAMMARS` when found.
-/// Returns `None` for unknown keys.
 pub fn language_for(key: &str) -> Option<Language> {
     let lang: Language = match key {
         "php" => tree_sitter_php::LANGUAGE_PHP.into(),
@@ -22,9 +17,7 @@ pub fn language_for(key: &str) -> Option<Language> {
         _ => return None,
     };
 
-    // Record usage for the summary log. Best-effort; ignore poison.
     if let Ok(mut set) = USED_GRAMMARS.lock() {
-        // Static str mapping so we store 'static refs.
         let static_key: &'static str = match key {
             "php" => "php",
             "go" => "go",
@@ -42,8 +35,6 @@ pub fn language_for(key: &str) -> Option<Language> {
     Some(lang)
 }
 
-/// Return the sorted list of grammar keys used so far this run.
-/// Returns `"none"` if no grammars were used.
 pub fn used_grammars_str() -> String {
     match USED_GRAMMARS.lock() {
         Ok(set) if set.is_empty() => "none".to_string(),
@@ -52,7 +43,6 @@ pub fn used_grammars_str() -> String {
     }
 }
 
-/// Reset the used-grammars set (useful in tests).
 #[cfg(test)]
 pub fn reset_used_grammars() {
     if let Ok(mut set) = USED_GRAMMARS.lock() {
@@ -119,7 +109,6 @@ mod tests {
         language_for("rust");
         language_for("python");
         let s = used_grammars_str();
-        // sorted alphabetically
         assert!(s.contains("python"), "got: {s}");
         assert!(s.contains("rust"), "got: {s}");
         reset_used_grammars();

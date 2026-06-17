@@ -1,11 +1,3 @@
-/// Python-compatible `str.splitlines()`.
-///
-/// Splits on the full universal-newline set:
-///   \n (LF), \r (CR), \r\n (CRLF), \x0B (VT), \x0C (FF),
-///   \x1C (FS), \x1D (GS), \x1E (RS), \u{85} (NEL), \u{2028} (LS), \u{2029} (PS)
-///
-/// `\r\n` is treated as a single boundary (not two).
-/// No trailing empty element is produced (matches Python's `str.splitlines()`).
 pub fn py_splitlines(s: &str) -> Vec<&str> {
     if s.is_empty() {
         return vec![];
@@ -18,21 +10,18 @@ pub fn py_splitlines(s: &str) -> Vec<&str> {
     let mut i = 0;
 
     while i < len {
-        // Determine if we're at a line boundary and its byte length.
         let boundary_len: Option<usize> = if bytes[i] == b'\r' {
-            // \r\n counts as one boundary
             if i + 1 < len && bytes[i + 1] == b'\n' {
                 Some(2)
             } else {
                 Some(1)
             }
         } else if bytes[i] == b'\n'
-            || bytes[i] == 0x0B  // VT
-            || bytes[i] == 0x0C  // FF
-            || bytes[i] == 0x1C  // FS
-            || bytes[i] == 0x1D  // GS
-            || bytes[i] == 0x1E
-        // RS
+            || bytes[i] == 0x0B // VT
+            || bytes[i] == 0x0C // FF
+            || bytes[i] == 0x1C // FS
+            || bytes[i] == 0x1D // GS
+            || bytes[i] == 0x1E // RS
         {
             Some(1)
         } else if bytes[i] == 0xC2 && i + 1 < len && bytes[i + 1] == 0x85 {
@@ -55,13 +44,11 @@ pub fn py_splitlines(s: &str) -> Vec<&str> {
             i += blen;
             line_start = i;
         } else {
-            // Advance by the length of the UTF-8 character.
             let ch_len = utf8_char_len(bytes[i]);
             i += ch_len;
         }
     }
 
-    // Push the final segment only if it's non-empty (no trailing empty element).
     if line_start < len {
         result.push(&s[line_start..]);
     }
@@ -69,7 +56,6 @@ pub fn py_splitlines(s: &str) -> Vec<&str> {
     result
 }
 
-/// Returns the byte length of a UTF-8 character given its leading byte.
 #[inline]
 fn utf8_char_len(b: u8) -> usize {
     if b < 0x80 {
@@ -83,12 +69,10 @@ fn utf8_char_len(b: u8) -> usize {
     }
 }
 
-/// True if `s` is empty or consists only of Python-`str.isspace()` whitespace.
-///
 /// Mirrors Python `not s.strip()`. Rust's `char::is_whitespace` follows the
-/// Unicode `White_Space` property, which omits the C0 separators
-/// U+001C..U+001F (FS, GS, RS, US) that Python treats as whitespace; this
-/// helper adds them back so blank-detection matches Python exactly.
+/// Unicode `White_Space` property, which omits the C0 separators U+001C..U+001F
+/// (FS, GS, RS, US) that Python treats as whitespace; this helper adds them back
+/// so blank-detection matches Python exactly.
 pub fn is_py_blank(s: &str) -> bool {
     s.chars()
         .all(|c| c.is_whitespace() || ('\u{1c}'..='\u{1f}').contains(&c))
@@ -115,7 +99,6 @@ mod tests {
 
     #[test]
     fn unicode_separators() {
-        // U+2028 line separator, U+0085 NEL, vertical tab, form feed
         assert_eq!(
             py_splitlines("a\u{2028}b\u{0085}c\u{000b}d\u{000c}e"),
             vec!["a", "b", "c", "d", "e"]
@@ -139,7 +122,6 @@ mod tests {
 
     #[test]
     fn no_trailing_empty_multiple() {
-        // Multiple trailing newlines: Python returns lines without trailing empty
         assert_eq!(py_splitlines("a\n\n"), vec!["a", ""]);
     }
 
@@ -152,7 +134,6 @@ mod tests {
     fn is_py_blank_matches_python_strip() {
         assert!(is_py_blank(""));
         assert!(is_py_blank("   \t"));
-        // FS, GS, RS, US — Python str.isspace() == True, Rust is_whitespace == false
         assert!(is_py_blank("\u{1c}\u{1d}\u{1e}\u{1f}"));
         assert!(is_py_blank("\u{1f}\u{1f}"));
         assert!(is_py_blank("\u{85}\u{2028}\u{2029}"));

@@ -6,17 +6,7 @@ use crate::splitlines::{is_py_blank, py_splitlines};
 use std::path::Path;
 use tree_sitter::{Node, Parser};
 
-/// A chunk: (line_no 1-based, body, node_type, scope).
 pub type Chunk = (usize, String, String, String);
-
-// ---------------------------------------------------------------------------
-// 3.1  line_window — sliding window, Python splitlines semantics
-// ---------------------------------------------------------------------------
-
-/// Sliding-window line chunking (spec §3.1 / Python _line_window).
-///
-/// Uses `py_splitlines` (Python `str.splitlines()` semantics).
-/// step = max(1, CHUNK_LINES - OVERLAP) = 100.
 pub fn line_window(text: &str) -> Vec<(usize, String)> {
     let lines = py_splitlines(text);
     if lines.is_empty() {
@@ -39,13 +29,6 @@ pub fn line_window(text: &str) -> Vec<(usize, String)> {
     result
 }
 
-// ---------------------------------------------------------------------------
-// 3.2  collect_semantic — pre-order walk, stop at targets
-// ---------------------------------------------------------------------------
-
-/// Pre-order walk: collect nodes whose kind is in semantic_types(lang).
-/// When a match is found, do NOT descend into it (Python: return after append).
-/// Iterates ALL children (named + unnamed) matching Python `n.children`.
 fn collect_semantic<'a>(node: Node<'a>, lang: &str) -> Vec<Node<'a>> {
     let targets = semantic_types(lang);
     let mut results = Vec::new();
@@ -65,16 +48,6 @@ fn walk_semantic<'a>(node: Node<'a>, targets: &[&str], out: &mut Vec<Node<'a>>) 
     }
 }
 
-// ---------------------------------------------------------------------------
-// 3.3  get_scope — climb parents, collect container names
-// ---------------------------------------------------------------------------
-
-/// Climb parents to build scope string (e.g. class name).
-/// Matches Python _get_scope exactly:
-///  - containers = scope_types(lang)
-///  - for each ancestor ∈ containers: take "name" field text
-///    ELIF ancestor.kind() == "impl_item": take "type" field text
-///  - reverse collected parts, join with "."
 fn get_scope(node: Node<'_>, lang: &str, source: &[u8]) -> String {
     let containers = scope_types(lang);
     let mut parts: Vec<String> = Vec::new();
@@ -95,22 +68,10 @@ fn get_scope(node: Node<'_>, lang: &str, source: &[u8]) -> String {
     parts.join(".")
 }
 
-/// Decode a node's source text with UTF-8 replacement (Python decode(..., errors="replace")).
 fn node_text(node: Node<'_>, source: &[u8]) -> String {
     String::from_utf8_lossy(&source[node.byte_range()]).into_owned()
 }
 
-// ---------------------------------------------------------------------------
-// 3.4  ts_chunk — tree-sitter semantic chunking
-// ---------------------------------------------------------------------------
-
-/// Semantic chunking via tree-sitter (spec §3.4 / Python _ts_chunk).
-///
-/// LINE SPLITTER NOTE (parity-critical):
-///  - Internal `lines` array for gap computation: `text.split('\n')` (plain, NOT splitlines).
-///    Matches Python line 272: `lines = text.split("\n")`.
-///  - `line_window` (called for gaps / oversized nodes) uses `py_splitlines` internally.
-///  - MAX_SEMANTIC_LINES check: `py_splitlines(&chunk_text).len()` (Python line 296 .splitlines()).
 pub fn ts_chunk(text: &str, lang: &str) -> Vec<Chunk> {
     // language_for also records the grammar as "used" for the grammars= log.
     let language = match language_for(lang) {
@@ -134,7 +95,6 @@ pub fn ts_chunk(text: &str, lang: &str) -> Vec<Chunk> {
         return vec![];
     }
 
-    // Sort by start byte (ascending) — matches Python nodes.sort(key=lambda n: n.start_byte)
     nodes.sort_by_key(|n| n.start_byte());
 
     // Plain '\n' split — matches Python `text.split("\n")` at line 272
@@ -199,14 +159,6 @@ pub fn ts_chunk(text: &str, lang: &str) -> Vec<Chunk> {
     results
 }
 
-// ---------------------------------------------------------------------------
-// 3.5  detect_lang
-// ---------------------------------------------------------------------------
-
-/// Map file path → tree-sitter language key (spec §3.5 / Python _detect_lang).
-///
-/// Returns None for `.blade.php` files.
-/// Extension lookup uses lowercase with leading dot (matching EXT_TO_LANG keys).
 pub fn detect_lang(path: &Path) -> Option<&'static str> {
     if path
         .file_name()
@@ -223,11 +175,6 @@ pub fn detect_lang(path: &Path) -> Option<&'static str> {
     ext_to_lang(&ext_lower)
 }
 
-// ---------------------------------------------------------------------------
-// 3.6  chunk_file
-// ---------------------------------------------------------------------------
-
-/// Chunk file contents — tree-sitter first, line-window fallback (spec §3.6).
 pub fn chunk_file(text: &str, path: &Path) -> Vec<Chunk> {
     if let Some(lang) = detect_lang(path) {
         let ts = ts_chunk(text, lang);
@@ -241,16 +188,10 @@ pub fn chunk_file(text: &str, path: &Path) -> Vec<Chunk> {
         .collect()
 }
 
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::path::Path;
-
-    // ---- Task 5: line_window ----
 
     #[test]
     fn windows_with_overlap() {
@@ -279,13 +220,8 @@ mod tests {
 
     #[test]
     fn us_separator_only_window_is_suppressed() {
-        // U+001F (US) is NOT a splitlines boundary but IS whitespace to Python
-        // str.strip(); such a window must be suppressed to match Python (it would
-        // otherwise emit an extra chunk and diverge the chunk-ID set).
         assert!(line_window("\u{1f}\u{1f}\u{1f}").is_empty());
     }
-
-    // ---- Task 6: semantic chunking ----
 
     #[test]
     fn python_semantic_scope_and_preamble() {
@@ -303,13 +239,11 @@ mod tests {
             "expected function_definition, got: {:?}",
             types
         );
-        // method hello has scope "Greeter"
         let hello = chunks
             .iter()
             .find(|c| c.1.contains("hi {name}"))
             .expect("hello chunk not found");
         assert_eq!(hello.3, "Greeter", "hello scope should be Greeter");
-        // top_level has empty scope
         let top = chunks
             .iter()
             .find(|c| c.1.contains("return 1"))
@@ -333,7 +267,6 @@ mod tests {
         crate::grammar::reset_used_grammars();
         let src = include_str!("../tests/fixtures/sample.rs");
         let chunks = chunk_file(src, Path::new("sample.rs"));
-        // method bar inside impl Foo should have scope "Foo"
         let bar = chunks
             .iter()
             .find(|c| c.1.contains("42"))
@@ -348,7 +281,7 @@ mod tests {
         assert_eq!(detect_lang(Path::new("foo.tsx")), Some("tsx"));
         assert_eq!(detect_lang(Path::new("foo.ts")), Some("typescript"));
         assert_eq!(detect_lang(Path::new("foo.mjs")), Some("javascript"));
-        assert_eq!(detect_lang(Path::new("README.md")), None); // not in EXT_TO_LANG
+        assert_eq!(detect_lang(Path::new("README.md")), None);
         assert_eq!(detect_lang(Path::new("x.blade.php")), None);
     }
 }

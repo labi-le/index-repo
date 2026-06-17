@@ -14,17 +14,12 @@ use anyhow::Result;
 use notify_debouncer_full::new_debouncer;
 use notify_debouncer_full::notify::{EventKind, RecursiveMode, Watcher};
 
-// ---------------------------------------------------------------------------
-// Public event type
-// ---------------------------------------------------------------------------
-
 pub enum Evt {
     Delete,
     Upsert,
 }
 
 /// Map a notify `EventKind` to our `Evt`.
-///
 /// Remove → Delete, Create/Modify → Upsert, everything else (Access/Other/Any) → None.
 /// Extracted from `run_daemon` so the service dispatcher reuses identical mapping.
 pub fn evt_for(kind: &EventKind) -> Option<Evt> {
@@ -34,10 +29,6 @@ pub fn evt_for(kind: &EventKind) -> Option<Evt> {
         _ => None,
     }
 }
-
-// ---------------------------------------------------------------------------
-// _safe: run a store Result, swallow on Err with exact spec §10.4 message
-// ---------------------------------------------------------------------------
 
 /// Call a store operation; on failure log exactly "daemon: chromadb call failed ({e})"
 /// and return `None`. Mirrors Python `_safe`.
@@ -52,10 +43,6 @@ macro_rules! safe {
         }
     };
 }
-
-// ---------------------------------------------------------------------------
-// build_path_to_ids  (Python _build_path_to_ids, lines 508-527)
-// ---------------------------------------------------------------------------
 
 /// Reconstruct `path → {chunk ids}` from the collection's own metadata.
 ///
@@ -78,10 +65,6 @@ pub fn build_path_to_ids(store: &dyn Store) -> HashMap<String, HashSet<String>> 
     mapping
 }
 
-// ---------------------------------------------------------------------------
-// process_changes  (Python _process_changes, lines 530-597)
-// ---------------------------------------------------------------------------
-
 /// Apply one debounced batch of filesystem events as a per-file delta.
 ///
 /// Returns `(added, deleted)`.
@@ -94,7 +77,7 @@ pub fn process_changes(
     path_to_ids: &mut HashMap<String, HashSet<String>>,
     all_ids: &mut HashSet<String>,
 ) -> (usize, usize) {
-    // Step 1: collapse batch into a per-rel action map (Delete wins).
+    // Collapse batch into a per-rel action map (Delete wins).
     let mut actions: HashMap<String, Evt> = HashMap::new();
     let mut paths: HashMap<String, PathBuf> = HashMap::new();
 
@@ -120,7 +103,6 @@ pub fn process_changes(
     let mut added: usize = 0;
     let mut deleted: usize = 0;
 
-    // Step 2: process each rel
     for (rel, action) in &actions {
         let path = &paths[rel];
 
@@ -139,7 +121,6 @@ pub fn process_changes(
             continue;
         }
 
-        // Upsert: recompute chunks
         let (_rel2, records, _ts, _win, ok) = chunks_for_file(path, root);
         if !ok {
             continue; // binary file slipped through
@@ -147,7 +128,7 @@ pub fn process_changes(
 
         let seen: HashSet<String> = records.iter().map(|r| r.id.clone()).collect();
 
-        // Stale: ids previously in this path that are no longer present
+        // Stale ids: previously in this path but no longer present after rechunk
         let stale: Vec<String> = path_to_ids
             .get(rel)
             .map(|old| old.difference(&seen).cloned().collect())
@@ -160,7 +141,6 @@ pub fn process_changes(
             deleted += stale.len();
         }
 
-        // New: records not yet in all_ids
         let new_records: Vec<Record> = records
             .into_iter()
             .filter(|r| !all_ids.contains(&r.id))

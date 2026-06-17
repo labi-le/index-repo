@@ -1,12 +1,9 @@
-// Constants copied verbatim from spec §2
-
 pub const CHUNK_LINES: usize = 120;
 pub const OVERLAP: usize = 20;
 pub const MAX_FILE_BYTES: u64 = 512 * 1024;
 pub const MAX_SEMANTIC_LINES: usize = 200;
 pub const BATCH: usize = 2000;
 
-/// Indexable file extensions (lowercased, with leading dot).
 pub const EXTS: &[&str] = &[
     ".py", ".pyi", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".php", ".go", ".rs", ".java",
     ".kt", ".swift", ".c", ".h", ".cc", ".cpp", ".hpp", ".rb", ".ex", ".exs", ".cs", ".nix",
@@ -14,10 +11,8 @@ pub const EXTS: &[&str] = &[
     ".jsonc", ".vue", ".svelte", ".html", ".css", ".scss",
 ];
 
-/// Special filenames (exact match on file name) also indexed.
 pub const SPECIAL_NAMES: &[&str] = &["Makefile", "Dockerfile", "Justfile", ".envrc"];
 
-/// Patterns prepended to .gitignore (gitwildmatch semantics).
 pub const EXTRA_IGNORE: &[&str] = &[
     ".git/",
     ".chroma/",
@@ -50,7 +45,6 @@ pub const EXTRA_IGNORE: &[&str] = &[
     "pnpm-lock.yaml",
 ];
 
-/// Returns the tree-sitter language key for a file extension (lowercased, with dot).
 pub fn ext_to_lang(ext: &str) -> Option<&'static str> {
     match ext {
         ".php" => Some("php"),
@@ -65,7 +59,6 @@ pub fn ext_to_lang(ext: &str) -> Option<&'static str> {
     }
 }
 
-/// Returns the semantic AST node kinds for a given language key.
 pub fn semantic_types(lang: &str) -> &'static [&'static str] {
     match lang {
         "php" => &["function_definition", "method_declaration"],
@@ -100,7 +93,6 @@ pub fn semantic_types(lang: &str) -> &'static [&'static str] {
     }
 }
 
-/// Returns the scope container node kinds for a given language key.
 pub fn scope_types(lang: &str) -> &'static [&'static str] {
     match lang {
         "php" => &[

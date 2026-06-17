@@ -2,10 +2,6 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
-// ---------------------------------------------------------------------------
-// Chunk metadata — serialises to the exact JSON ChromaDB expects (spec §1.2 / §4)
-// ---------------------------------------------------------------------------
-
 /// Per-chunk metadata stored in ChromaDB.
 ///
 /// JSON shape:
@@ -16,17 +12,11 @@ pub struct Meta {
     pub path: String,
     pub line: usize,
     pub lang: String,
-    /// ChromaDB metadata key is literally `"type"`.
     #[serde(rename = "type")]
     pub node_type: String,
-    /// Omitted from JSON when empty.
     #[serde(skip_serializing_if = "String::is_empty", default)]
     pub scope: String,
 }
-
-// ---------------------------------------------------------------------------
-// A computed chunk ready to be sent to the store
-// ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone)]
 pub struct Record {
@@ -34,10 +24,6 @@ pub struct Record {
     pub body: String,
     pub meta: Meta,
 }
-
-// ---------------------------------------------------------------------------
-// One-shot statistics (spec §6)
-// ---------------------------------------------------------------------------
 
 #[derive(Debug, Default, Clone)]
 pub struct Stats {
@@ -49,10 +35,6 @@ pub struct Stats {
     pub win_chunks: usize,
     pub skipped_bin: usize,
 }
-
-// ---------------------------------------------------------------------------
-// Store trait (spec §8 ops needed by oneshot / daemon)
-// ---------------------------------------------------------------------------
 
 pub trait Store {
     /// Verify reachability (heartbeat). Used by main for exit code 3.
@@ -83,20 +65,10 @@ pub trait Store {
     fn count(&self) -> Result<usize>;
 }
 
-// ---------------------------------------------------------------------------
-// Embed trait
-// ---------------------------------------------------------------------------
-
-/// Abstraction over embedding computation.
-/// Implemented by the real fastembed embedder (Task 9) and FakeEmbed in tests.
 pub trait Embed {
     /// Embed document bodies → one 384-dim L2-normalised vector each, in order.
     fn embed(&self, docs: &[String]) -> Result<Vec<Vec<f32>>>;
 }
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {

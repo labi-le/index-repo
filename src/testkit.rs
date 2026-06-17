@@ -1,16 +1,7 @@
-//! Test-support utilities shared across modules.
-//! Only compiled in `#[cfg(test)]` builds (declared as `#[cfg(test)] pub(crate) mod testkit`).
-
 use crate::store::{Embed, Meta, Record, Store};
 use anyhow::Result;
 use std::collections::HashSet;
 
-// ---------------------------------------------------------------------------
-// MockStore
-// ---------------------------------------------------------------------------
-
-/// In-memory `Store` implementation for unit tests.
-/// Tracks every call so tests can assert on what was added/deleted.
 pub(crate) struct MockStore {
     pub ids: HashSet<String>,
     pub metas: Vec<(String, Meta)>,
@@ -30,7 +21,6 @@ impl MockStore {
         }
     }
 
-    /// Pre-seed existing ids (simulate a collection that already has chunks).
     pub(crate) fn with_ids(mut self, ids: impl IntoIterator<Item = String>) -> Self {
         self.ids.extend(ids);
         self
@@ -77,11 +67,6 @@ impl Store for MockStore {
     }
 }
 
-// ---------------------------------------------------------------------------
-// FakeEmbed
-// ---------------------------------------------------------------------------
-
-/// Zero-vector embedder for tests — avoids onnxruntime.
 pub(crate) struct FakeEmbed;
 
 impl Embed for FakeEmbed {

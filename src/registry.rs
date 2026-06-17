@@ -8,7 +8,6 @@ pub struct Registry {
 }
 
 impl Registry {
-    /// Production base: `$XDG_RUNTIME_DIR/index-repo` (fallback `/tmp/index-repo-<uid>`).
     pub fn from_env() -> Self {
         let base = match std::env::var_os("XDG_RUNTIME_DIR") {
             Some(dir) if !dir.is_empty() => PathBuf::from(dir).join("index-repo"),
@@ -20,12 +19,10 @@ impl Registry {
         Self { base }
     }
 
-    /// Test/injectable base.
     pub fn with_base(base: impl Into<PathBuf>) -> Self {
         Self { base: base.into() }
     }
 
-    /// Directory holding the per-(root, pid) marker files: `<base>/roots`.
     pub fn roots_dir(&self) -> PathBuf {
         self.base.join("roots")
     }
@@ -34,19 +31,16 @@ impl Registry {
         self.base.join("serve.lock")
     }
 
-    /// Canonicalize a path.
     pub fn canonical(path: &Path) -> Result<PathBuf> {
         std::fs::canonicalize(path).with_context(|| format!("canonicalize {}", path.display()))
     }
 
-    /// First 16 hex chars of the SHA-1 of the canonical path's bytes.
     pub fn hash(canonical: &Path) -> String {
         let digest = Sha1::digest(canonical.as_os_str().as_encoded_bytes());
         let hex = hex_encode(&digest);
         hex[..16].to_string()
     }
 
-    /// Register `(root, pid)` by writing a marker file containing the canonical path.
     pub fn register(&self, path: &Path, pid: u32) -> Result<()> {
         let canonical = Self::canonical(path)?;
         let roots = self.roots_dir();
@@ -58,7 +52,6 @@ impl Registry {
         Ok(())
     }
 
-    /// Remove the marker for `(root, pid)`. Missing file is not an error.
     pub fn unregister(&self, path: &Path, pid: u32) -> Result<()> {
         let canonical = Self::canonical(path)?;
         let marker = self
@@ -71,7 +64,6 @@ impl Registry {
         }
     }
 
-    /// Scan markers, GC dead pids, and return the deduped set of live canonical roots.
     pub fn scan(&self) -> Result<Vec<PathBuf>> {
         let roots = self.roots_dir();
         let entries = match std::fs::read_dir(&roots) {
@@ -106,9 +98,8 @@ impl Registry {
         Ok(live.into_keys().collect())
     }
 
-    /// Acquire the single-instance serve lock via `flock(LOCK_EX | LOCK_NB)`.
-    ///
-    /// Caller MUST keep the returned `File` alive to hold the lock.
+    /// Caller MUST keep the returned `File` alive to hold the lock — `flock`
+    /// is released when the file descriptor is dropped.
     pub fn acquire_serve_lock(&self) -> Result<Option<std::fs::File>> {
         use std::os::unix::io::AsRawFd;
 
@@ -135,9 +126,6 @@ impl Registry {
     }
 }
 
-/// Check whether a pid is alive via `kill(pid, 0)`.
-///
-/// Alive if the call returns 0 or `errno == EPERM`; dead if `errno == ESRCH`.
 pub fn pid_alive(pid: u32) -> bool {
     let ret = unsafe { libc::kill(pid as i32, 0) };
     if ret == 0 {

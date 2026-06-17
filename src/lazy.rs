@@ -46,7 +46,7 @@ mod tests {
             std::env::var("INDEX_REPO_MODEL_DIR"),
             std::env::var("ORT_DYLIB_PATH"),
         ) else {
-            return; // skip when model env absent
+            return;
         };
 
         let embedder = LazyEmbedder::new();

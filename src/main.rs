@@ -5,10 +5,6 @@ use index_repo::store::Store as _;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-// ---------------------------------------------------------------------------
-// CLI surface — subcommands + backward-compatible flat (legacy) args
-// ---------------------------------------------------------------------------
-
 #[derive(Parser, Debug)]
 #[command(
     about = "Semantic code indexer for ChromaDB using tree-sitter AST parsing.",
@@ -91,10 +87,6 @@ struct LegacyArgs {
     pub debounce: u64,
 }
 
-// ---------------------------------------------------------------------------
-// Entry point
-// ---------------------------------------------------------------------------
-
 fn main() -> ExitCode {
     let cli = Cli::parse();
 
@@ -129,27 +121,18 @@ fn main() -> ExitCode {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Legacy one-shot / --daemon path (today's `run()` body, verbatim logic)
-// ---------------------------------------------------------------------------
-
 fn legacy_run(args: LegacyArgs) -> anyhow::Result<ExitCode> {
-    // Step 1: resolve root path; use canonicalize, fall back to absolute.
-    // Python: root = Path(args.path).resolve()
     let root: PathBuf = std::fs::canonicalize(&args.path).unwrap_or_else(|_| {
-        // Path doesn't exist yet — still produce an absolute path for the error message.
         std::env::current_dir()
             .unwrap_or_else(|_| PathBuf::from("."))
             .join(&args.path)
     });
 
     if !root.is_dir() {
-        // Python: print(f"error: {root} is not a directory", file=sys.stderr)
         eprintln!("error: {} is not a directory", root.display());
         return Ok(ExitCode::from(2));
     }
 
-    // Step 2: collection name  (Python: collection_name = args.collection or f"code-{root.name}")
     let collection_name = args.collection.clone().unwrap_or_else(|| {
         format!(
             "code-{}",
@@ -159,7 +142,6 @@ fn legacy_run(args: LegacyArgs) -> anyhow::Result<ExitCode> {
         )
     });
 
-    // Step 3: mode string
     let mode_str = if args.daemon {
         "daemon"
     } else if args.full_rebuild {
@@ -168,9 +150,6 @@ fn legacy_run(args: LegacyArgs) -> anyhow::Result<ExitCode> {
         "incremental"
     };
 
-    // Step 4: startup line (Python: file=sys.stderr)
-    // Python: f"indexing {root} → {args.host}:{args.port}  collection={collection_name} mode={mode_str}"
-    // Arrow is U+2192 →, two spaces before collection=
     eprintln!(
         "indexing {} \u{2192} {}:{}  collection={} mode={}",
         root.display(),
@@ -180,11 +159,8 @@ fn legacy_run(args: LegacyArgs) -> anyhow::Result<ExitCode> {
         mode_str
     );
 
-    // Step 5: heartbeat / reachability
     let mut store = index_repo::chroma::HttpStore::new(&args.host, args.port, args.ssl);
     if let Err(e) = store.heartbeat() {
-        // Python: print(f"error: cannot reach chromadb at {host}:{port} ({e})\nis `systemctl...`",
-        //               file=sys.stderr)
         eprintln!(
             "error: cannot reach chromadb at {}:{} ({})\nis `systemctl status chromadb` running?",
             args.host, args.port, e
@@ -192,33 +168,26 @@ fn legacy_run(args: LegacyArgs) -> anyhow::Result<ExitCode> {
         return Ok(ExitCode::from(3));
     }
 
-    // Step 6: build ignore spec
     let spec = index_repo::walk::load_ignore(&root);
 
-    // Step 7: full rebuild — delete collection (errors swallowed internally)
     if args.full_rebuild {
         let _ = store.delete_collection(&collection_name);
     }
 
-    // Step 8: get or create collection
     store.get_or_create(&collection_name)?;
 
-    // Step 9: build embedder (requires INDEX_REPO_MODEL_DIR)
     let embedder = index_repo::embed::Embedder::from_env()?;
 
-    // Step 10: daemon mode
     if args.daemon {
         let code =
             index_repo::daemon::run_daemon(&mut store, &embedder, &root, &spec, args.debounce)?;
         return Ok(ExitCode::from(code as u8));
     }
 
-    // Step 11: one-shot incremental index
     let stats = index_repo::oneshot::one_shot_index(&mut store, &embedder, &root, &spec)?;
     let grammars = index_repo::grammar::used_grammars_str();
     let count = store.count()?;
 
-    // Python: print(f"done. files=... ", file=sys.stderr)
     eprintln!(
         "done. files={} added={} unchanged={} deleted={} \
          (tree-sitter={}, window={}) skipped_binary={} grammars={} \
@@ -237,10 +206,6 @@ fn legacy_run(args: LegacyArgs) -> anyhow::Result<ExitCode> {
 
     Ok(ExitCode::SUCCESS)
 }
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
@@ -293,8 +258,6 @@ mod tests {
 
     #[test]
     fn not_a_dir_returns_code_2() {
-        // Drive the not-a-dir branch without any network call by calling
-        // legacy_run() with a path that is clearly not a directory.
         let a = LegacyArgs {
             path: "/tmp/this_path_definitely_does_not_exist_xyz_12345".to_string(),
             host: "127.0.0.1".to_string(),

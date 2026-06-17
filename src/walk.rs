@@ -3,10 +3,6 @@ use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
-// ---------------------------------------------------------------------------
-// Ignore matcher (spec §5.1)
-// ---------------------------------------------------------------------------
-
 /// Wrapper so callers don't need to import `ignore` directly.
 pub struct Ignore(Gitignore);
 
@@ -25,13 +21,10 @@ impl Ignore {
 pub fn load_ignore(root: &Path) -> Ignore {
     let mut builder = GitignoreBuilder::new(root);
 
-    // 1. Prepend EXTRA_IGNORE patterns
     for pat in EXTRA_IGNORE {
-        // Ignore builder errors — pattern just won't apply
         let _ = builder.add_line(None, pat);
     }
 
-    // 2. Append lines from root/.gitignore (if it exists)
     let gitignore_path = root.join(".gitignore");
     if gitignore_path.is_file() {
         if let Ok(content) = std::fs::read_to_string(&gitignore_path) {
@@ -42,15 +35,10 @@ pub fn load_ignore(root: &Path) -> Ignore {
     }
 
     let gi = builder.build().unwrap_or_else(|_| {
-        // Fall back to an empty matcher on build error
         GitignoreBuilder::new(root).build().unwrap()
     });
     Ignore(gi)
 }
-
-// ---------------------------------------------------------------------------
-// File iterator (spec §5.2)
-// ---------------------------------------------------------------------------
 
 /// Return all indexable files under `root` (spec §5.2).
 ///
@@ -73,12 +61,10 @@ pub fn iter_files(root: &Path, spec: &Ignore) -> Vec<PathBuf> {
     {
         let path = entry.path();
 
-        // We only care about regular files.
         if !entry.file_type().is_file() {
             continue;
         }
 
-        // Rule 1: extension or special name check
         let file_name = match path.file_name().and_then(|n| n.to_str()) {
             Some(n) => n,
             None => continue,
@@ -95,18 +81,13 @@ pub fn iter_files(root: &Path, spec: &Ignore) -> Vec<PathBuf> {
             continue;
         }
 
-        // Rule 2: not ignored — check relative POSIX path against matcher
         let rel = match path.strip_prefix(root) {
             Ok(r) => r,
             Err(_) => continue,
         };
 
-        // Convert to a POSIX-style string for the matcher
         let rel_posix = posix_str(rel);
 
-        // matched_path_or_any_parents checks both the path itself and all
-        // ancestor dirs, so a file inside node_modules/ will be caught even
-        // if the pattern is "node_modules/" (directory pattern).
         if spec
             .0
             .matched_path_or_any_parents(Path::new(&rel_posix), false)
@@ -115,7 +96,6 @@ pub fn iter_files(root: &Path, spec: &Ignore) -> Vec<PathBuf> {
             continue;
         }
 
-        // Rule 3: file size
         match entry.metadata() {
             Ok(m) if m.len() <= MAX_FILE_BYTES => {}
             _ => continue,
@@ -139,10 +119,6 @@ fn posix_str(p: &Path) -> String {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -150,21 +126,14 @@ mod tests {
 
     fn make_tree() -> tempfile::TempDir {
         let d = tempfile::tempdir().unwrap();
-        // Normal indexable files
         fs::write(d.path().join("a.rs"), "fn x(){}").unwrap();
         fs::write(d.path().join("hello.py"), "x=1").unwrap();
-        // Special name
         fs::write(d.path().join(".envrc"), "export X=1").unwrap();
-        // Ignored via EXTRA_IGNORE (node_modules/)
         fs::create_dir_all(d.path().join("node_modules")).unwrap();
         fs::write(d.path().join("node_modules/b.js"), "1").unwrap();
-        // Non-indexable extension
         fs::write(d.path().join("photo.png"), "x").unwrap();
-        // Dotfile with indexable extension — must be INCLUDED (not hidden-filtered)
         fs::write(d.path().join(".foo.py"), "# hidden").unwrap();
-        // Oversize file
         fs::write(d.path().join("big.rs"), "x".repeat(600 * 1024)).unwrap();
-        // .gitignore excludes ignored.rs
         fs::write(d.path().join(".gitignore"), "ignored.rs\n").unwrap();
         fs::write(d.path().join("ignored.rs"), "fn y(){}").unwrap();
         d
