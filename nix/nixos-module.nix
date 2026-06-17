@@ -56,9 +56,16 @@ in
   };
 
   config = lib.mkIf cfg.enable {
+    environment.systemPackages = [ cfg.package ];
+
     systemd.user.services.index-repo = {
       description = "Code indexer (shared singleton)";
-      after = [ "basic.target" ];
+      documentation = [ "https://github.com/labi-le/index-repo" ];
+      after = [
+        "basic.target"
+        "network.target"
+      ];
+      wants = [ "network-online.target" ];
       wantedBy = [ "default.target" ];
       unitConfig.ConditionUser = "!@system";
       serviceConfig = {
