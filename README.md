@@ -43,3 +43,79 @@ See [`docs/spec.md`](docs/spec.md) for the behavioral-parity contract and
 
 - **Warm path (3.76×):** parallel walk/parse/hash via `rayon` + no uv/Python startup overhead. The incremental diff (fetch-existing-ids → set-diff → no-op add) is the dominant cost; Rust does it faster with less GC pressure.
 - **Cold path (37×):** fastembed's onnxruntime batching is dramatically more efficient than chromadb's default Python embedding function for 206 chunks. The Python client embeds client-side via `chromadb`'s built-in EF (also onnxruntime, but single-threaded and with Python overhead per batch); fastembed uses multi-threaded ort internally.
+
+---
+
+## OpenCode integration
+
+The repo ships an [OpenCode](https://opencode.ai) plugin at
+[`hooks/opencode/chroma-gate.ts`](hooks/opencode/chroma-gate.ts) that steers
+agents toward the index this daemon builds:
+
+- Injects a system rule: **call `chroma_query_documents` first**, before
+  `grep`/`glob`.
+- **Blocks** unscoped `grep`/`glob` for a fixed set of agents
+  (`build`, `orchestrator`, `general`, `explore`, `explorer`, `plan`) until a
+  chroma query has run in the session. Narrowed searches (a concrete
+  `path` + `include` for grep, or a concrete `path`/`pattern` for glob) are
+  always allowed.
+- The collection name is derived at **runtime** as
+  `code-<basename of workspace root>` — exactly the scheme the indexer uses
+  (`code-{}` of `root.file_name()`), so the hint always matches the live
+  collection without per-project configuration.
+
+### Install (Nix / home-manager)
+
+The flake's `homeManagerModules.default` deploys the plugin and (optionally)
+registers the `chroma` MCP server. Add the module to your home-manager config
+(e.g. via `sharedModules` or `imports`) and enable it:
+
+```nix
+{
+  # Deploy the chroma-gate plugin to ~/.config/opencode/plugins/chroma-gate.ts
+  services.index-repo.opencode.chromaGate.enable = true;
+
+  # Optional: also register the `chroma` MCP server in opencode. Host/port/ssl
+  # default to the NixOS `services.index-repo.{host,port,ssl}` of this indexer,
+  # so they stay in sync automatically. Needs `uvx` (uv) on PATH for chroma-mcp.
+  services.index-repo.opencode.chromaMcp = {
+    enable = true;
+    # host = "192.168.1.2";  # override if your ChromaDB is elsewhere
+    # port = 8000;
+    # ssl  = false;
+  };
+}
+```
+
+`chromaMcp` writes `programs.opencode.settings.mcp.chroma`, so it requires the
+home-manager `programs.opencode` module to be present.
+
+### Install (manual / non-Nix)
+
+1. Copy the plugin into your opencode plugins dir:
+
+   ```sh
+   mkdir -p ~/.config/opencode/plugins
+   cp hooks/opencode/chroma-gate.ts ~/.config/opencode/plugins/
+   ```
+
+2. Register a `chroma` MCP server in your opencode config
+   (`~/.config/opencode/opencode.json`), pointed at the same ChromaDB the
+   indexer writes to:
+
+   ```json
+   {
+     "mcp": {
+       "chroma": {
+         "type": "local",
+         "command": ["uvx", "chroma-mcp", "--client-type", "http",
+                     "--host", "127.0.0.1", "--port", "8000", "--ssl", "false"],
+         "enabled": true
+       }
+     }
+   }
+   ```
+
+The plugin computes the collection from the workspace basename, so no further
+configuration is required — start an agent in the indexed repo and it will be
+told to query `code-<basename>` first.
