@@ -56,6 +56,19 @@ pub fn route_all<'a>(path: &Path, roots: &'a [PathBuf]) -> Vec<&'a PathBuf> {
     roots.iter().filter(|r| path.starts_with(r)).collect()
 }
 
+/// If `path` is a registered root's OWN `.gitignore`, return that root.
+///
+/// Only a root's direct `.gitignore` triggers a live reload; nested
+/// `.gitignore`s are intentionally ignored to preserve single-file selection
+/// parity with Python (spec §5.1).
+pub fn gitignore_root<'a>(path: &Path, roots: &'a [PathBuf]) -> Option<&'a PathBuf> {
+    if path.file_name().and_then(|n| n.to_str()) != Some(".gitignore") {
+        return None;
+    }
+    let parent = path.parent()?;
+    roots.iter().find(|r| r.as_path() == parent)
+}
+
 /// Compute `(to_start, to_stop)` between the desired root set and the currently
 /// running set. `to_start` preserves `desired` order; `to_stop` is the current
 /// roots no longer desired.
@@ -312,6 +325,11 @@ pub fn run_serve(host: &str, port: u16, ssl: bool, debounce_ms: u64) -> Result<i
                             registry_changed = true;
                             continue;
                         }
+                        if let Some(root) = gitignore_root(path, &active_roots) {
+                            specs.insert(root.clone(), load_ignore(root));
+                            eprintln!("service: reloaded .gitignore for {}", root.display());
+                            continue;
+                        }
                         for root in route_all(path, &active_roots) {
                             let Some(spec) = specs.get(root) else {
                                 continue;
@@ -426,6 +444,40 @@ mod tests {
     fn route_component_wise_no_false_prefix() {
         let roots = vec![PathBuf::from("/a/bb")];
         assert_eq!(route(Path::new("/a/b/c.rs"), &roots), None);
+    }
+
+    #[test]
+    fn gitignore_root_matches_each_roots_own_gitignore() {
+        let roots = vec![PathBuf::from("/repo"), PathBuf::from("/repo/sub")];
+        assert_eq!(
+            gitignore_root(Path::new("/repo/.gitignore"), &roots),
+            Some(&PathBuf::from("/repo"))
+        );
+        assert_eq!(
+            gitignore_root(Path::new("/repo/sub/.gitignore"), &roots),
+            Some(&PathBuf::from("/repo/sub")),
+            "each root's own .gitignore maps to that root"
+        );
+    }
+
+    #[test]
+    fn gitignore_root_rejects_nested_and_non_gitignore() {
+        let roots = vec![PathBuf::from("/repo")];
+        assert_eq!(
+            gitignore_root(Path::new("/repo/src/.gitignore"), &roots),
+            None,
+            "a nested .gitignore is not a reload trigger (single-file parity)"
+        );
+        assert_eq!(
+            gitignore_root(Path::new("/repo/src/main.rs"), &roots),
+            None,
+            "an ordinary file is not a .gitignore"
+        );
+        assert_eq!(
+            gitignore_root(Path::new("/other/.gitignore"), &roots),
+            None,
+            "a .gitignore whose parent is not a registered root is ignored"
+        );
     }
 
     #[test]
