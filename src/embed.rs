@@ -3,15 +3,34 @@ use fastembed::{
     InitOptionsUserDefined, Pooling, TextEmbedding, TokenizerFiles, UserDefinedEmbeddingModel,
 };
 use std::path::Path;
-use std::sync::{Mutex, Once};
+use std::sync::{LazyLock, Mutex, Once};
 
 static ORT_INIT: Once = Once::new();
 
-// Must byte-match chromadb DefaultEmbeddingFunction (_forward batch=32,
-// enable_truncation=256) or vectors diverge from the chroma-mcp query path.
-const INTRA_THREADS: usize = 4;
-const EMBED_BATCH: usize = 32;
-const MAX_LENGTH: usize = 256;
+// Defaults byte-match chromadb's DefaultEmbeddingFunction (batch=32,
+// truncation=256, mean pooling) so index vectors stay in the same vector space
+// as the chroma-mcp query path. Override the env vars ONLY if you also switch
+// the query path to a matching model/config (see INDEX_REPO_MODEL_DIR).
+static INTRA_THREADS: LazyLock<usize> = LazyLock::new(|| env_usize("INDEX_REPO_INTRA_THREADS", 4));
+static EMBED_BATCH: LazyLock<usize> = LazyLock::new(|| env_usize("INDEX_REPO_EMBED_BATCH", 32));
+static MAX_LENGTH: LazyLock<usize> = LazyLock::new(|| env_usize("INDEX_REPO_MAX_LENGTH", 256));
+
+fn env_usize(key: &str, default: usize) -> usize {
+    std::env::var(key)
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(default)
+}
+
+/// Pooling strategy, overridable via `INDEX_REPO_POOLING` (`mean` | `cls`).
+/// Default `mean` matches all-MiniLM-L6-v2; a code model may need `cls`.
+fn env_pooling() -> Pooling {
+    match std::env::var("INDEX_REPO_POOLING").as_deref() {
+        Ok("cls") | Ok("CLS") => Pooling::Cls,
+        _ => Pooling::Mean,
+    }
+}
 
 fn maybe_init_ort() {
     ORT_INIT.call_once(|| {
@@ -53,7 +72,7 @@ impl Embedder {
         };
 
         let model_def =
-            UserDefinedEmbeddingModel::new(onnx_bytes, tokenizer_files).with_pooling(Pooling::Mean); // all-MiniLM-L6-v2: mean-pool + L2-norm
+            UserDefinedEmbeddingModel::new(onnx_bytes, tokenizer_files).with_pooling(env_pooling());
 
         // CPU::with_arena_allocator(false) → DisableCpuMemArena: scratch is
         // freed after each inference instead of pooled and retained for the
@@ -61,8 +80,8 @@ impl Embedder {
         let te = TextEmbedding::try_new_from_user_defined(
             model_def,
             InitOptionsUserDefined::default()
-                .with_intra_threads(INTRA_THREADS)
-                .with_max_length(MAX_LENGTH)
+                .with_intra_threads(*INTRA_THREADS)
+                .with_max_length(*MAX_LENGTH)
                 .with_execution_providers(vec![ort::ep::CPU::default()
                     .with_arena_allocator(false)
                     .build()]),
@@ -80,7 +99,7 @@ impl crate::store::Embed for Embedder {
             return Ok(vec![]);
         }
         let mut guard = self.model.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
-        let out = guard.embed(docs, Some(EMBED_BATCH))?;
+        let out = guard.embed(docs, Some(*EMBED_BATCH))?;
         Ok(out)
     }
 }

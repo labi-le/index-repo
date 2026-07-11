@@ -41,8 +41,34 @@ See [`docs/spec.md`](docs/spec.md) for the behavioral-parity contract and
 
 ### Why
 
-- **Warm path (3.76×):** parallel walk/parse/hash via `rayon` + no uv/Python startup overhead. The incremental diff (fetch-existing-ids → set-diff → no-op add) is the dominant cost; Rust does it faster with less GC pressure.
+- **Warm path (3.76×):** no uv/Python interpreter startup plus a native single-pass walk/parse/hash. The incremental diff (fetch-existing-ids → set-diff → no-op add) dominates the warm cost; Rust does it with far less allocation and no GC pressure.
 - **Cold path (37×):** fastembed's onnxruntime batching is dramatically more efficient than chromadb's default Python embedding function for 206 chunks. The Python client embeds client-side via `chromadb`'s built-in EF (also onnxruntime, but single-threaded and with Python overhead per batch); fastembed uses multi-threaded ort internally.
+
+---
+
+## Configuration
+
+Configured by CLI flags (`--host`, `--port`, `--ssl`, `--collection`,
+`--full-rebuild`, `--daemon`, `--debounce`) and environment variables:
+
+| Env var | Default | Purpose |
+|---------|---------|---------|
+| `INDEX_REPO_MODEL_DIR` | (Nix wrapper) | Directory of the ONNX model + tokenizer files. Point at another model to swap embedders — **the query path (chroma-mcp) must use the same model** or vectors diverge. |
+| `INDEX_REPO_CHROMA_TOKEN` | (unset) | Static token sent as `Authorization: Bearer <token>` on every ChromaDB request. Unset → unauthenticated. |
+| `INDEX_REPO_MAX_FILE_BYTES` | `524288` | Max indexable file size in bytes. |
+| `INDEX_REPO_MAX_LENGTH` | `256` | Embedding token truncation length. `256` byte-matches chromadb's default EF; raise only if the query path matches. |
+| `INDEX_REPO_INTRA_THREADS` | `4` | ONNX intra-op threads. |
+| `INDEX_REPO_EMBED_BATCH` | `32` | Embedding batch size. |
+| `INDEX_REPO_POOLING` | `mean` | Token pooling: `mean` or `cls`. |
+
+Default host is `127.0.0.1`; set `--host` (or NixOS `services.index-repo.host`)
+for a remote ChromaDB.
+
+### Languages
+
+Tree-sitter AST chunking covers **Python, JavaScript, TypeScript, TSX, Rust, Go,
+PHP, Bash, Java, C, C++, C#, Ruby**. Every other indexable extension falls back
+to fixed 120-line overlapping windows.
 
 ---
 
@@ -59,10 +85,13 @@ agents toward the index this daemon builds:
   chroma query has run in the session. Narrowed searches (a concrete
   `path` + `include` for grep, or a concrete `path`/`pattern` for glob) are
   always allowed.
-- The collection name is derived at **runtime** as
-  `code-<basename of workspace root>` — exactly the scheme the indexer uses
-  (`code-{}` of `root.file_name()`), so the hint always matches the live
-  collection without per-project configuration.
+- The collection name is resolved at **runtime** to match the indexer exactly:
+  `code-<owner>-<repo>` from the repo's git `origin` remote (stable across
+  machines/clones), or `code-<basename>-<hash8>` when there is no git remote — so
+  the hint always matches the live collection and repos never collide.
+- Enforcement is configurable: `CHROMA_GATE_ENFORCE=0` disables blocking (the
+  system-rule hint still injects); `CHROMA_GATE_AGENTS=a,b,c` overrides the
+  enforced-agent set.
 
 ### Install (Nix / home-manager)
 
@@ -116,6 +145,7 @@ home-manager `programs.opencode` module to be present.
    }
    ```
 
-The plugin computes the collection from the workspace basename, so no further
-configuration is required — start an agent in the indexed repo and it will be
-told to query `code-<basename>` first.
+The plugin resolves the collection the same way the indexer does — from the git
+`origin` remote (`code-<owner>-<repo>`), falling back to `code-<basename>-<hash8>`
+— so no configuration is needed: start an agent in the indexed repo and it will
+be told to query that collection first.

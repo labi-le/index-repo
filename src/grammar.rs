@@ -14,6 +14,11 @@ pub fn language_for(key: &str) -> Option<Language> {
         "python" => tree_sitter_python::LANGUAGE.into(),
         "rust" => tree_sitter_rust::LANGUAGE.into(),
         "bash" => tree_sitter_bash::LANGUAGE.into(),
+        "java" => tree_sitter_java::LANGUAGE.into(),
+        "c" => tree_sitter_c::LANGUAGE.into(),
+        "cpp" => tree_sitter_cpp::LANGUAGE.into(),
+        "csharp" => tree_sitter_c_sharp::LANGUAGE.into(),
+        "ruby" => tree_sitter_ruby::LANGUAGE.into(),
         _ => return None,
     };
 
@@ -27,6 +32,11 @@ pub fn language_for(key: &str) -> Option<Language> {
             "python" => "python",
             "rust" => "rust",
             "bash" => "bash",
+            "java" => "java",
+            "c" => "c",
+            "cpp" => "cpp",
+            "csharp" => "csharp",
+            "ruby" => "ruby",
             _ => unreachable!(),
         };
         set.insert(static_key);
@@ -66,6 +76,11 @@ mod tests {
             "python",
             "rust",
             "bash",
+            "java",
+            "c",
+            "cpp",
+            "csharp",
+            "ruby",
         ] {
             assert!(language_for(k).is_some(), "missing grammar {k}");
         }
@@ -83,6 +98,11 @@ mod tests {
             ("python", "def f():\n    pass"),
             ("rust", "fn main() {}"),
             ("bash", "f() { echo hi; }"),
+            ("java", "class A { void f() {} }"),
+            ("c", "int f(void) { return 0; }"),
+            ("cpp", "int f() { return 0; }"),
+            ("csharp", "class A { void F() {} }"),
+            ("ruby", "def f; 1; end"),
         ];
         for (lang, snippet) in snippets {
             let language = language_for(lang).expect(lang);

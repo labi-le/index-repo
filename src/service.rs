@@ -106,12 +106,7 @@ fn actor_loop(
     embedder: Arc<LazyEmbedder>,
     rx: Receiver<Vec<(Evt, PathBuf)>>,
 ) {
-    let collection = format!(
-        "code-{}",
-        root.file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("unknown")
-    );
+    let collection = crate::config::collection_name(&root);
 
     let mut store = HttpStore::new(&conn.host, conn.port, conn.ssl);
     if let Err(e) = store.get_or_create(&collection) {

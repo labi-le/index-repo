@@ -24,7 +24,7 @@ enum Command {
     /// Run the shared always-on service (single shared model, all active roots).
     Serve {
         /// ChromaDB host
-        #[arg(long, default_value = "192.168.1.2")]
+        #[arg(long, default_value = "127.0.0.1")]
         host: String,
         /// ChromaDB port
         #[arg(long, default_value_t = 8000)]
@@ -59,14 +59,14 @@ struct LegacyArgs {
     pub path: String,
 
     /// ChromaDB host
-    #[arg(long, default_value = "192.168.1.2")]
+    #[arg(long, default_value = "127.0.0.1")]
     pub host: String,
 
     /// ChromaDB port
     #[arg(long, default_value_t = 8000)]
     pub port: u16,
 
-    /// Collection name (default: code-<basename>)
+    /// Collection name (default: code-<basename>-<hash8>)
     #[arg(long)]
     pub collection: Option<String>,
 
@@ -133,14 +133,10 @@ fn legacy_run(args: LegacyArgs) -> anyhow::Result<ExitCode> {
         return Ok(ExitCode::from(2));
     }
 
-    let collection_name = args.collection.clone().unwrap_or_else(|| {
-        format!(
-            "code-{}",
-            root.file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("unknown")
-        )
-    });
+    let collection_name = args
+        .collection
+        .clone()
+        .unwrap_or_else(|| index_repo::config::collection_name(&root));
 
     let mode_str = if args.daemon {
         "daemon"
@@ -217,7 +213,7 @@ mod tests {
         let cli = Cli::parse_from(["index-repo"]);
         assert!(cli.command.is_none());
         let a = cli.legacy;
-        assert_eq!(a.host, "192.168.1.2");
+        assert_eq!(a.host, "127.0.0.1");
         assert_eq!(a.port, 8000);
         assert_eq!(a.debounce, 800);
         assert_eq!(a.path, ".");
@@ -282,7 +278,7 @@ mod tests {
                 ssl,
                 debounce,
             }) => {
-                assert_eq!(host, "192.168.1.2");
+                assert_eq!(host, "127.0.0.1");
                 assert_eq!(port, 8000);
                 assert!(!ssl);
                 assert_eq!(debounce, 800);

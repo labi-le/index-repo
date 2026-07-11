@@ -8,6 +8,7 @@ pub(crate) struct MockStore {
     pub added: Vec<(Record, Vec<f32>)>,
     pub deleted: Vec<String>,
     pub collection: Option<String>,
+    pub fail_add: bool,
 }
 
 impl MockStore {
@@ -18,11 +19,17 @@ impl MockStore {
             added: Vec::new(),
             deleted: Vec::new(),
             collection: None,
+            fail_add: false,
         }
     }
 
     pub(crate) fn with_ids(mut self, ids: impl IntoIterator<Item = String>) -> Self {
         self.ids.extend(ids);
+        self
+    }
+
+    pub(crate) fn with_failing_add(mut self) -> Self {
+        self.fail_add = true;
         self
     }
 }
@@ -47,6 +54,9 @@ impl Store for MockStore {
         Ok(self.metas.clone())
     }
     fn add(&mut self, records: &[Record], embeddings: &[Vec<f32>]) -> Result<usize> {
+        if self.fail_add {
+            anyhow::bail!("simulated add failure");
+        }
         for (r, e) in records.iter().zip(embeddings.iter()) {
             self.ids.insert(r.id.clone());
             self.metas.push((r.id.clone(), r.meta.clone()));

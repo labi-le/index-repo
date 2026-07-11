@@ -284,4 +284,70 @@ mod tests {
         assert_eq!(detect_lang(Path::new("README.md")), None);
         assert_eq!(detect_lang(Path::new("x.blade.php")), None);
     }
+
+    #[test]
+    fn new_language_grammars_chunk_semantically() {
+        // (path, source, expected semantic node_type) — guards config node-kind names.
+        let cases: &[(&str, &str, &str)] = &[
+            (
+                "A.java",
+                "class A {\n  void greet() {\n    return;\n  }\n}\n",
+                "method_declaration",
+            ),
+            (
+                "m.c",
+                "int add(int a, int b) {\n    return a + b;\n}\n",
+                "function_definition",
+            ),
+            (
+                "m.cpp",
+                "int add(int a) {\n    return a;\n}\n",
+                "function_definition",
+            ),
+            (
+                "P.cs",
+                "class P {\n    void Run() {\n        return;\n    }\n}\n",
+                "method_declaration",
+            ),
+            ("m.rb", "def add(a, b)\n  a + b\nend\n", "method"),
+        ];
+        for (name, src, want) in cases {
+            let types: Vec<String> = chunk_file(src, Path::new(name))
+                .into_iter()
+                .map(|c| c.2)
+                .collect();
+            assert!(
+                types.iter().any(|t| t == want),
+                "{name}: expected node type {want}, got {types:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn java_method_scope_is_class() {
+        let src = "class Foo {\n  int bar() {\n    return 42;\n  }\n}\n";
+        let chunks = chunk_file(src, Path::new("Foo.java"));
+        let bar = chunks
+            .iter()
+            .find(|c| c.1.contains("42"))
+            .expect("bar chunk");
+        assert_eq!(
+            bar.3, "Foo",
+            "java method scope should be Foo, got: {bar:?}"
+        );
+    }
+
+    #[test]
+    fn ruby_method_scope_is_class() {
+        let src = "class Foo\n  def bar\n    42\n  end\nend\n";
+        let chunks = chunk_file(src, Path::new("foo.rb"));
+        let bar = chunks
+            .iter()
+            .find(|c| c.1.contains("42"))
+            .expect("bar chunk");
+        assert_eq!(
+            bar.3, "Foo",
+            "ruby method scope should be Foo, got: {bar:?}"
+        );
+    }
 }

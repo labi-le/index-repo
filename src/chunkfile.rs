@@ -41,10 +41,12 @@ pub fn chunks_for_file(path: &Path, root: &Path) -> (String, Vec<Record>, usize,
         Err(_) => return (rel, vec![], 0, 0, true),
     };
 
-    let text = match String::from_utf8(bytes) {
-        Ok(s) => s,
-        Err(_) => return (rel, vec![], 0, 0, false),
-    };
+    // A file with NUL bytes is treated as binary and skipped; otherwise decode
+    // lossily so latin-1 / mis-encoded source is still indexed, not dropped.
+    if bytes.contains(&0) {
+        return (rel, vec![], 0, 0, false);
+    }
+    let text = String::from_utf8_lossy(&bytes).into_owned();
 
     let lang = lang_field(path);
     let mut records = Vec::new();
@@ -118,13 +120,27 @@ mod tests {
     }
 
     #[test]
-    fn chunks_for_file_binary_returns_not_ok() {
+    fn chunks_for_file_nul_bytes_treated_as_binary() {
         let d = tempfile::tempdir().unwrap();
         let p = d.path().join("bin.py");
-        fs::write(&p, b"\xff\xfe not utf8").unwrap();
+        fs::write(&p, b"\x00\x01\x02 binary").unwrap();
         let (_, recs, _, _, ok) = chunks_for_file(&p, d.path());
-        assert!(!ok, "binary file should have ok=false");
+        assert!(!ok, "file with NUL bytes should be binary (ok=false)");
         assert!(recs.is_empty());
+    }
+
+    #[test]
+    fn chunks_for_file_non_utf8_is_indexed_lossily() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("latin1.py");
+        // Invalid UTF-8 (0xE9) but no NUL → mis-encoded source; index it lossily.
+        fs::write(&p, b"# caf\xe9\ndef f():\n    return 1\n").unwrap();
+        let (_, recs, _, _, ok) = chunks_for_file(&p, d.path());
+        assert!(
+            ok,
+            "non-UTF-8 text without NUL should be indexed, not skipped"
+        );
+        assert!(!recs.is_empty(), "should produce chunks from lossy decode");
     }
 
     #[test]

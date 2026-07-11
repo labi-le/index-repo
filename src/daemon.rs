@@ -109,15 +109,21 @@ pub fn process_changes(
         let is_delete = matches!(action, Evt::Delete) || !path.exists();
 
         if is_delete {
-            let old: HashSet<String> = path_to_ids.remove(rel).unwrap_or_default();
-            if !old.is_empty() {
-                let old_vec: Vec<String> = old.iter().cloned().collect();
-                safe!(store.delete(&old_vec));
+            let old: HashSet<String> = path_to_ids.get(rel).cloned().unwrap_or_default();
+            if old.is_empty() {
+                path_to_ids.remove(rel);
+                continue;
+            }
+            let old_vec: Vec<String> = old.iter().cloned().collect();
+            if safe!(store.delete(&old_vec)).is_some() {
+                path_to_ids.remove(rel);
                 for id in &old {
                     all_ids.remove(id);
                 }
                 deleted += old.len();
             }
+            // On delete failure keep path_to_ids[rel] + all_ids so the next event
+            // retries — never silently forget chunks we failed to delete.
             continue;
         }
 
@@ -127,6 +133,10 @@ pub fn process_changes(
         }
 
         let seen: HashSet<String> = records.iter().map(|r| r.id.clone()).collect();
+        // Whether every store op for this file landed. On any failure we leave the
+        // previous path_to_ids mapping in place so the next event recomputes the
+        // delta and retries (eventual consistency instead of silent drift).
+        let mut sync_ok = true;
 
         // Stale ids: previously in this path but no longer present after rechunk
         let stale: Vec<String> = path_to_ids
@@ -134,11 +144,14 @@ pub fn process_changes(
             .map(|old| old.difference(&seen).cloned().collect())
             .unwrap_or_default();
         if !stale.is_empty() {
-            safe!(store.delete(&stale));
-            for id in &stale {
-                all_ids.remove(id);
+            if safe!(store.delete(&stale)).is_some() {
+                for id in &stale {
+                    all_ids.remove(id);
+                }
+                deleted += stale.len();
+            } else {
+                sync_ok = false;
             }
-            deleted += stale.len();
         }
 
         let new_records: Vec<Record> = records
@@ -147,23 +160,28 @@ pub fn process_changes(
             .collect();
         if !new_records.is_empty() {
             let docs: Vec<String> = new_records.iter().map(|r| r.body.clone()).collect();
-            match embedder.embed(&docs) {
-                Ok(embeddings) => {
-                    let _ = safe!(store.add(&new_records, &embeddings));
-                }
+            let added_ok = match embedder.embed(&docs) {
+                Ok(embeddings) => safe!(store.add(&new_records, &embeddings)).is_some(),
                 Err(e) => {
-                    eprintln!("daemon: chromadb call failed ({e})");
+                    eprintln!("daemon: embedding failed ({e})");
+                    false
                 }
+            };
+            if added_ok {
+                // Only mark ids present once the add landed, so a failed batch is
+                // retried on the next event instead of being lost.
+                for r in &new_records {
+                    all_ids.insert(r.id.clone());
+                }
+                added += new_records.len();
+            } else {
+                sync_ok = false;
             }
-            // State updates are UNCONDITIONAL (mirrors Python which updates all_ids/added
-            // regardless of whether col.add succeeded — the call is fire-and-forget via _safe)
-            for r in &new_records {
-                all_ids.insert(r.id.clone());
-            }
-            added += new_records.len();
         }
 
-        path_to_ids.insert(rel.clone(), seen);
+        if sync_ok {
+            path_to_ids.insert(rel.clone(), seen);
+        }
     }
 
     if added > 0 || deleted > 0 {
@@ -570,5 +588,55 @@ mod tests {
         assert!(!watch_keep(d.path(), &spec, Path::new("/tmp/outside.rs")));
         // No size check: a path that doesn't exist is still kept (delete events)
         assert!(watch_keep(d.path(), &spec, &d.path().join("ghost.rs")));
+    }
+    // ---- process_changes: add-failure retry (no silent drift) ----
+
+    #[test]
+    fn failed_add_is_retried_on_next_event() {
+        let d = tempfile::tempdir().unwrap();
+        let py_path = setup_file(d.path(), "a.py", "def f():\n    return 1\n");
+
+        let mut path_to_ids: HashMap<String, HashSet<String>> = HashMap::new();
+        let mut all_ids: HashSet<String> = HashSet::new();
+
+        // Phase 1: store.add fails — nothing must be marked present.
+        let mut mock = MockStore::new().with_failing_add();
+        let changes = vec![(Evt::Upsert, py_path.clone())];
+        let (added1, _) = process_changes(
+            &mut mock,
+            &FakeEmbed,
+            d.path(),
+            &changes,
+            &mut path_to_ids,
+            &mut all_ids,
+        );
+        assert_eq!(added1, 0, "failed add must not count as added");
+        assert!(
+            all_ids.is_empty(),
+            "no ids marked present after a failed add"
+        );
+        assert!(
+            !path_to_ids.contains_key("a.py"),
+            "path mapping must not be committed on failure"
+        );
+        assert!(mock.ids.is_empty(), "nothing landed in the store");
+
+        // Phase 2: same file, store healthy — the add must be retried, not lost.
+        mock.fail_add = false;
+        let (added2, _) = process_changes(
+            &mut mock,
+            &FakeEmbed,
+            d.path(),
+            &changes,
+            &mut path_to_ids,
+            &mut all_ids,
+        );
+        assert!(added2 >= 1, "healthy retry must add the chunks");
+        assert!(!all_ids.is_empty(), "ids present after successful retry");
+        assert!(
+            path_to_ids.contains_key("a.py"),
+            "mapping committed on success"
+        );
+        assert!(!mock.ids.is_empty(), "chunks landed in the store on retry");
     }
 }

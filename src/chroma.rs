@@ -1,6 +1,7 @@
 use crate::store::{Meta, Record, Store};
 use anyhow::{bail, Result};
 use reqwest::blocking::Client;
+use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::HashSet;
@@ -21,6 +22,18 @@ pub fn collections_path(base: &str) -> String {
     format!("{base}/tenants/default_tenant/databases/default_database/collections")
 }
 
+/// Build the `Authorization` header value for a ChromaDB static token.
+///
+/// Returns `None` for an empty/whitespace token or one carrying illegal header
+/// bytes, so a malformed token disables auth rather than panicking the client.
+fn auth_header_value(token: &str) -> Option<HeaderValue> {
+    let token = token.trim();
+    if token.is_empty() {
+        return None;
+    }
+    HeaderValue::from_str(&format!("Bearer {token}")).ok()
+}
+
 // ---------------------------------------------------------------------------
 // HttpStore
 // ---------------------------------------------------------------------------
@@ -33,9 +46,18 @@ pub struct HttpStore {
 
 impl HttpStore {
     pub fn new(host: &str, port: u16, ssl: bool) -> Self {
-        let client = Client::builder()
-            .build()
-            .expect("failed to build reqwest client");
+        let mut builder = Client::builder();
+        // Optional static-token auth (`Authorization: Bearer <token>`) from
+        // INDEX_REPO_CHROMA_TOKEN. Absent → unauthenticated (the LAN default).
+        if let Some(value) = std::env::var("INDEX_REPO_CHROMA_TOKEN")
+            .ok()
+            .and_then(|t| auth_header_value(&t))
+        {
+            let mut headers = HeaderMap::new();
+            headers.insert(AUTHORIZATION, value);
+            builder = builder.default_headers(headers);
+        }
+        let client = builder.build().expect("failed to build reqwest client");
         Self {
             client,
             base: base_url(host, port, ssl),
@@ -416,5 +438,21 @@ mod tests {
             "offset": 0usize,
         });
         assert_eq!(body["include"], json!(["metadatas"]));
+    }
+
+    // ---- auth header ----
+
+    #[test]
+    fn auth_header_value_formats_bearer() {
+        let v = auth_header_value("secret-token").expect("valid token");
+        assert_eq!(v.to_str().unwrap(), "Bearer secret-token");
+    }
+
+    #[test]
+    fn auth_header_value_rejects_empty_and_invalid() {
+        assert!(auth_header_value("").is_none());
+        assert!(auth_header_value("   ").is_none());
+        // A newline is an illegal header byte → auth disabled, not a panic.
+        assert!(auth_header_value("bad\ntoken").is_none());
     }
 }

@@ -104,7 +104,7 @@ pub fn iter_files(root: &Path, spec: &Ignore) -> Vec<PathBuf> {
         }
 
         match entry.metadata() {
-            Ok(m) if m.len() <= MAX_FILE_BYTES => {}
+            Ok(m) if m.len() <= *MAX_FILE_BYTES => {}
             _ => continue,
         }
 

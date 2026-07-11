@@ -51,7 +51,7 @@ in
         call `chroma_query_documents` first and blocks unscoped grep/glob (for a
         fixed set of agents) until a chroma query has run in the session. The
         enforced collection name is derived at runtime as
-        `code-<basename of workspace root>`, matching this indexer's naming'';
+        `code-<owner>-<repo>` (from the git remote, else `code-<basename>-<hash8>`), matching this indexer's naming'';
 
       chromaMcp = {
         enable = lib.mkEnableOption ''

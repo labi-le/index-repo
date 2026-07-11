@@ -22,7 +22,7 @@ in
 
     host = lib.mkOption {
       type = lib.types.str;
-      default = "192.168.1.2";
+      default = "127.0.0.1";
       description = "ChromaDB host the indexer writes to.";
     };
 

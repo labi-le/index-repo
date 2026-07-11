@@ -125,7 +125,7 @@ mod tests {
     #[test]
     fn binary_file_skipped() {
         let d = tempfile::tempdir().unwrap();
-        fs::write(d.path().join("bin.py"), b"\xff\xfe not utf8 content").unwrap();
+        fs::write(d.path().join("bin.py"), b"\x00\x01\x02 binary content").unwrap();
         let mut mock = MockStore::new();
         let spec = crate::walk::load_ignore(d.path());
         let stats = one_shot_index(&mut mock, &FakeEmbed, d.path(), &spec).unwrap();

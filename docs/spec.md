@@ -595,3 +595,47 @@ from the Python script via `writeTextFile`. It will instead build this crate.
   unbounded response.
 - **`grammars=` log**: track grammars actually used to mirror Python's lazy set.
 ```
+
+---
+
+## 16. Intentional deviations from strict parity (post-v0.1 hardening)
+
+The v0.1 goal was byte-for-byte parity with `index_repo.py`. The following
+changes deliberately break that contract to fix correctness, coverage, and
+security drawbacks. A one-time `--full-rebuild` (or letting the daemon re-sync)
+migrates existing collections.
+
+- **Collection name** is now git-identity based: `code-<owner>-<repo>` (plus the
+  in-repo sub-path when nested) from `remote.origin.url`, stable across machines
+  and clones. Without a git remote it falls back to `code-<basename>-<hash8>`
+  (SHA1 of the canonical path). Previously `code-<basename>` alone, which let two
+  same-basename repos collide onto one collection and delete each other's chunks.
+  The `chroma-gate.ts` plugin mirrors the scheme (including the git lookup).
+  Caveat: two local checkouts of the *same* remote now map to one collection —
+  index only one at a time, or pass `--collection`.
+- **Daemon consistency**: `process_changes` updates in-memory state
+  (`all_ids`/`path_to_ids`) only after the ChromaDB add/delete actually
+  succeeds; a failed call is retried on the next fs event instead of being
+  silently marked present (no more index drift on transient failures).
+- **Non-UTF-8 files** are indexed via lossy decode; only files containing NUL
+  bytes are treated as binary and skipped (previously any invalid UTF-8 was
+  dropped).
+- **Grammars**: added Java, C, C++, C#, Ruby (13 languages total). Other
+  extensions still fall back to line-window chunking.
+- **Configurable knobs** (env, defaults preserve v0.1 vectors/behavior):
+  `INDEX_REPO_MAX_FILE_BYTES`, `INDEX_REPO_MAX_LENGTH`, `INDEX_REPO_INTRA_THREADS`,
+  `INDEX_REPO_EMBED_BATCH`, `INDEX_REPO_POOLING`, `INDEX_REPO_CHROMA_TOKEN`.
+- **Default host** is `127.0.0.1` (was `192.168.1.2`); set `--host` for remote.
+- **Auth**: `INDEX_REPO_CHROMA_TOKEN` sends `Authorization: Bearer <token>`.
+
+### Deliberately NOT changed (tradeoffs / external coupling)
+
+- **Chunk-id scheme** `sha1(rel:line:body)` keeps `line`: a moved chunk gets a
+  new id (re-embed churn). This is the price of always-correct line numbers in
+  results, which a code-search tool needs. Kept.
+- **Embedding model** (`all-MiniLM-L6-v2`) and **256-token** truncation remain
+  the defaults: the query path (`chroma-mcp` / chromadb DefaultEmbeddingFunction)
+  is external, so swapping requires changing both sides. Now env-overridable for
+  users who control both.
+- **Single-file `.gitignore`** selection (no nested/global excludes) is retained
+  for selection parity; changing it is a broad semantics change.
