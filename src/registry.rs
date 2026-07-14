@@ -46,8 +46,13 @@ impl Registry {
         let roots = self.roots_dir();
         std::fs::create_dir_all(&roots)
             .with_context(|| format!("create_dir_all {}", roots.display()))?;
+        // Compute the collection name here — `register` runs client-side where
+        // `git` is available — and persist it in the marker so the daemon never
+        // has to shell out to git (see `scan`).
+        let collection = crate::config::collection_name(&canonical);
         let marker = roots.join(format!("{}.{}", Self::hash(&canonical), pid));
-        std::fs::write(&marker, canonical.to_string_lossy().as_bytes())
+        let content = format!("{}\n{}", canonical.to_string_lossy(), collection);
+        std::fs::write(&marker, content.as_bytes())
             .with_context(|| format!("write marker {}", marker.display()))?;
         Ok(())
     }
@@ -64,7 +69,11 @@ impl Registry {
         }
     }
 
-    pub fn scan(&self) -> Result<Vec<PathBuf>> {
+    /// Returns `(canonical_root, collection_name)` for every live marker.
+    /// The collection name is read from the marker (written by `register`);
+    /// legacy path-only markers fall back to the git-free name so the daemon
+    /// stays git-free.
+    pub fn scan(&self) -> Result<Vec<(PathBuf, String)>> {
         let roots = self.roots_dir();
         let entries = match std::fs::read_dir(&roots) {
             Ok(e) => e,
@@ -72,8 +81,9 @@ impl Registry {
             Err(e) => return Err(e).with_context(|| format!("read_dir {}", roots.display())),
         };
 
-        // BTreeMap dedupes by path and yields deterministic ordering.
-        let mut live: BTreeMap<PathBuf, ()> = BTreeMap::new();
+        // BTreeMap dedupes by path and yields deterministic ordering; the value
+        // is the collection name recorded in the marker.
+        let mut live: BTreeMap<PathBuf, String> = BTreeMap::new();
         for entry in entries {
             let entry = entry?;
             let name = entry.file_name();
@@ -88,14 +98,25 @@ impl Registry {
             let path = entry.path();
             if pid_alive(pid) {
                 if let Ok(contents) = std::fs::read_to_string(&path) {
-                    live.insert(PathBuf::from(contents), ());
+                    let mut lines = contents.lines();
+                    let Some(root) = lines.next() else {
+                        continue;
+                    };
+                    let root = PathBuf::from(root);
+                    // Line 2 holds the precomputed collection name; a legacy
+                    // path-only marker falls back to the git-free name.
+                    let collection = lines
+                        .next()
+                        .map(str::to_string)
+                        .unwrap_or_else(|| crate::config::fallback_collection_name(&root));
+                    live.insert(root, collection);
                 }
             } else {
                 let _ = std::fs::remove_file(&path);
             }
         }
 
-        Ok(live.into_keys().collect())
+        Ok(live.into_iter().collect())
     }
 
     /// Caller MUST keep the returned `File` alive to hold the lock — `flock`
@@ -161,7 +182,9 @@ mod tests {
 
         let canonical = Registry::canonical(root.path()).unwrap();
         let scanned = reg.scan().unwrap();
-        assert_eq!(scanned, vec![canonical]);
+        assert_eq!(scanned.len(), 1);
+        assert_eq!(scanned[0].0, canonical);
+        assert!(scanned[0].1.starts_with("code-"), "marker records a name");
     }
 
     #[test]
@@ -226,7 +249,8 @@ mod tests {
 
         let canonical = Registry::canonical(root.path()).unwrap();
         let scanned = reg.scan().unwrap();
-        assert_eq!(scanned, vec![canonical.clone()]);
+        assert_eq!(scanned.len(), 1);
+        assert_eq!(scanned[0].0, canonical);
 
         // Both live markers must remain on disk.
         let roots = reg.roots_dir();
@@ -234,6 +258,51 @@ mod tests {
         let marker_b = roots.join(format!("{}.{}", Registry::hash(&canonical), pid_b));
         assert!(marker_a.exists());
         assert!(marker_b.exists());
+    }
+
+    #[test]
+    fn scan_reads_collection_name_from_marker() {
+        let base = tempdir().unwrap();
+        let root = tempdir().unwrap();
+        let reg = Registry::with_base(base.path());
+
+        let pid = std::process::id();
+        let canonical = Registry::canonical(root.path()).unwrap();
+        let roots = reg.roots_dir();
+        std::fs::create_dir_all(&roots).unwrap();
+        let marker = roots.join(format!("{}.{}", Registry::hash(&canonical), pid));
+        // Marker carries the precomputed name on line 2 — scan returns it verbatim.
+        std::fs::write(
+            &marker,
+            format!("{}\ncode-custom-xyz", canonical.to_string_lossy()),
+        )
+        .unwrap();
+
+        let scanned = reg.scan().unwrap();
+        assert_eq!(scanned, vec![(canonical, "code-custom-xyz".to_string())]);
+    }
+
+    #[test]
+    fn scan_legacy_path_only_marker_falls_back() {
+        let base = tempdir().unwrap();
+        let root = tempdir().unwrap();
+        let reg = Registry::with_base(base.path());
+
+        let pid = std::process::id();
+        let canonical = Registry::canonical(root.path()).unwrap();
+        let roots = reg.roots_dir();
+        std::fs::create_dir_all(&roots).unwrap();
+        let marker = roots.join(format!("{}.{}", Registry::hash(&canonical), pid));
+        // Legacy format: path only, no name line — daemon must not need git.
+        std::fs::write(&marker, canonical.to_string_lossy().as_bytes()).unwrap();
+
+        let scanned = reg.scan().unwrap();
+        assert_eq!(scanned.len(), 1);
+        assert_eq!(scanned[0].0, canonical);
+        assert_eq!(
+            scanned[0].1,
+            crate::config::fallback_collection_name(&canonical)
+        );
     }
 
     #[test]

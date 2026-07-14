@@ -44,11 +44,14 @@ Layout:
 $XDG_RUNTIME_DIR/index-repo/
   serve.lock              # flock target for the singleton guard (§5)
   roots/
-    <hash>.<pid>          # file content = canonical absolute path (one line)
+    <hash>.<pid>          # line 1 = canonical absolute path; line 2 = collection name
 ```
 - `<hash>` = first 16 hex of `sha1(canonical_path)`; groups all sessions of one root.
 - `<pid>` = the opencode wrapper shell PID, passed in by the wrapper (see §6 note).
-- content = `canonicalize(path)` (symlinks resolved) — one canonical identity.
+- content = line 1 `canonicalize(path)` (symlinks resolved); line 2 = the
+  collection name, computed by `register` client-side (where git is available)
+  so the daemon never shells out to git. Legacy path-only markers fall back to
+  the git-free `fallback_collection_name`.
 
 Refcount: `desired_roots = { canonical_path : ∃ file <hash>.<pid> with pid alive }`.
 Indexer started on 0→≥1, stopped on ≥1→0.

@@ -31,6 +31,13 @@ pub fn collection_name(root: &Path) -> String {
     if let Some(slug) = git_slug(root) {
         return finalize_collection(&slug);
     }
+    fallback_collection_name(root)
+}
+
+/// Git-free name: `code-<basename>-<hash8>` (`hash8` = first 8 hex of SHA1 of the
+/// canonical path). Used by the daemon when a marker carries no precomputed name,
+/// so `serve` never has to shell out to `git`.
+pub fn fallback_collection_name(root: &Path) -> String {
     let base = root
         .file_name()
         .and_then(|n| n.to_str())

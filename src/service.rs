@@ -102,12 +102,11 @@ struct Actor {
 /// Runs the initial `one_shot_index`, then serially applies batches.
 fn actor_loop(
     root: PathBuf,
+    collection: String,
     conn: Conn,
     embedder: Arc<LazyEmbedder>,
     rx: Receiver<Vec<(Evt, PathBuf)>>,
 ) {
-    let collection = crate::config::collection_name(&root);
-
     let mut store = HttpStore::new(&conn.host, conn.port, conn.ssl);
     if let Err(e) = store.get_or_create(&collection) {
         eprintln!("service: {} get_or_create failed: {e}", root.display());
@@ -178,8 +177,10 @@ fn reconcile<W: Watcher>(
     }
 
     let desired = reg.scan()?;
+    let names: HashMap<PathBuf, String> = desired.iter().cloned().collect();
+    let desired_roots: Vec<PathBuf> = desired.into_iter().map(|(root, _)| root).collect();
     let current: HashSet<PathBuf> = actors.keys().cloned().collect();
-    let (to_start, to_stop) = reconcile_diff(&desired, &current);
+    let (to_start, to_stop) = reconcile_diff(&desired_roots, &current);
 
     for root in to_stop {
         if let Some(actor) = actors.remove(&root) {
@@ -202,11 +203,17 @@ fn reconcile<W: Watcher>(
         }
         specs.insert(root.clone(), load_ignore(&root));
 
+        let collection = names
+            .get(&root)
+            .cloned()
+            .unwrap_or_else(|| crate::config::fallback_collection_name(&root));
+
         let (tx, actor_rx) = channel::<Vec<(Evt, PathBuf)>>();
         let emb = Arc::clone(embedder);
         let root_thread = root.clone();
         let conn_thread = conn.clone();
-        let join = thread::spawn(move || actor_loop(root_thread, conn_thread, emb, actor_rx));
+        let join =
+            thread::spawn(move || actor_loop(root_thread, collection, conn_thread, emb, actor_rx));
         actors.insert(root.clone(), Actor { tx, join });
 
         if let Err(e) = watcher.watch(&root, RecursiveMode::Recursive) {
