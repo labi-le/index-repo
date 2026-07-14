@@ -355,10 +355,11 @@ verify reachability; on failure the CLI exits 3 (see §10).
 body `{"name": <name>, "metadata": {"hnsw:space":"cosine"}, "get_or_create":
 true}` → `{"id": <uuid>, ...}`. Cache the returned `id` for record ops.
 
-### 8.3 delete collection (only for `--full-rebuild`)
-Resolve the collection id (get-or-create or GET by name), then
-`DELETE /api/v2/.../collections/{id}`. Ignore "not found"/errors (Python
-swallows all). Then re-create via §8.2.
+### 8.3 delete collection (`--full-rebuild` + TTL GC)
+`DELETE /api/v2/.../collections/{name}` — **by name, not id**. This ChromaDB
+build rejects delete-by-id with 404 (verified against the deployed server), and
+the Python client deletes by name, so by-name is the parity-correct path. Ignore
+"not found"/errors (swallow all). `--full-rebuild` then re-creates via §8.2.
 
 ### 8.4 get records
 `POST /api/v2/.../collections/{id}/get` body `{"include": []}` for ids-only, or
@@ -381,6 +382,17 @@ unbounded `/get` may be capped. Accumulate all ids/metadatas.
 the one-shot summary line.
 
 Reuse a single `reqwest::blocking::Client` (keep-alive) for all calls.
+
+### 8.8 list collections (TTL GC)
+`GET /api/v2/.../collections?limit=<n>` → array of
+`{"id", "name", "metadata": {...}|null, ...}`. The sweep reads each collection's
+`metadata.index_repo` (bool) + `metadata.last_indexed` (unix seconds).
+
+### 8.9 stamp collection metadata (TTL GC)
+`PUT /api/v2/.../collections/{id}` body
+`{"new_metadata": {"index_repo": true, "last_indexed": <unix_secs>}}`. Metadata
+is overwritten **wholesale** (both keys always sent); the hnsw config (a
+separate field) is untouched.
 
 ---
 
@@ -639,3 +651,35 @@ migrates existing collections.
   users who control both.
 - **Single-file `.gitignore`** selection (no nested/global excludes) is retained
   for selection parity; changing it is a broad semantics change.
+
+---
+
+## 17. Collection TTL garbage collection (serve daemon)
+
+Post-parity feature: the `serve` daemon drops ChromaDB collections not indexed
+for longer than a TTL, so abandoned repos don't accumulate forever. Queries (via
+`chroma-mcp`) are invisible to the indexer, so the "interaction" signal is
+**index activity**: a collection is refreshed whenever its repo is opened
+(registered → synced) or its files change.
+
+**Metadata** (per collection, in ChromaDB `metadata`; see §8.8/§8.9):
+- `index_repo: true` — ownership marker. GC only ever considers marked
+  collections; foreign collections (other tools sharing the ChromaDB) are never
+  touched.
+- `last_indexed: <unix_secs>` — updated by the actor.
+
+**Stamping** (`service::actor_loop`, serve only): on initial sync, on each change
+batch, and every `TOUCH_INTERVAL` (6 h) while the root stays registered — so an
+open-but-idle repo never ages out and other indexer hosts see it as fresh.
+`get_or_create` / one-shot / legacy `--daemon` are unchanged (parity intact);
+collections they create are adopted (marked) the first time a serve actor stamps
+them.
+
+**Sweep** (`service::run_serve`, every `GC_SWEEP_INTERVAL` = 6 h): `gc_decide`
+selects marked collections whose `now - last_indexed > TTL`; each is dropped via
+§8.3 (delete by name). Marked collections without a timestamp are skipped
+(grace). Cross-host safe: any live daemon drops a globally-stale collection, and
+a double delete is a harmless no-op.
+
+**Config**: `INDEX_REPO_TTL_DAYS` (default `30`; `0` disables GC),
+`INDEX_REPO_GC_DRY_RUN` (`1`/`true` → log candidates without deleting).

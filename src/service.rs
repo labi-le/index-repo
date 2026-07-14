@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use notify_debouncer_full::new_debouncer;
@@ -22,10 +22,23 @@ use crate::daemon::{build_path_to_ids, evt_for, process_changes, watch_keep, Evt
 use crate::lazy::LazyEmbedder;
 use crate::oneshot::one_shot_index;
 use crate::registry::Registry;
-use crate::store::Store;
+use crate::store::{CollectionInfo, Store};
 use crate::walk::{load_ignore, Ignore};
 
 const GC_INTERVAL: Duration = Duration::from_secs(30);
+/// How often the serve daemon runs the collection TTL sweep, and how often an
+/// active actor re-stamps its collection so an open-but-idle repo never ages
+/// out (and other indexer hosts see it as fresh).
+const GC_SWEEP_INTERVAL: Duration = Duration::from_secs(6 * 3600);
+const TOUCH_INTERVAL: Duration = Duration::from_secs(6 * 3600);
+
+/// Current unix time in seconds (0 if the clock predates the epoch).
+fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
 
 #[derive(Clone)]
 struct Conn {
@@ -90,6 +103,56 @@ pub fn reconcile_diff(
     (to_start, to_stop)
 }
 
+/// Names of `index_repo`-owned collections whose `last_indexed` is older than
+/// `ttl_secs`. `ttl_secs == 0` disables GC (returns empty). Collections without
+/// the marker or without a timestamp are never returned.
+pub fn gc_decide(collections: &[CollectionInfo], now: u64, ttl_secs: u64) -> Vec<String> {
+    if ttl_secs == 0 {
+        return Vec::new();
+    }
+    collections
+        .iter()
+        .filter(|c| c.index_repo)
+        .filter_map(|c| Some((c, c.last_indexed?)))
+        .filter(|(_, t)| now.saturating_sub(*t) > ttl_secs)
+        .map(|(c, _)| c.name.clone())
+        .collect()
+}
+
+/// List collections and drop those `gc_decide` selects. Returns the number
+/// actually dropped. `dry_run` logs candidates without deleting.
+fn gc_sweep(store: &mut dyn Store, now: u64, ttl_secs: u64, dry_run: bool) -> usize {
+    let collections = match store.list_collections() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("service: gc list_collections failed: {e}");
+            return 0;
+        }
+    };
+    let doomed = gc_decide(&collections, now, ttl_secs);
+    let mut dropped = 0usize;
+    for name in &doomed {
+        let age_days = collections
+            .iter()
+            .find(|c| &c.name == name)
+            .and_then(|c| c.last_indexed)
+            .map(|t| now.saturating_sub(t) / 86_400)
+            .unwrap_or(0);
+        if dry_run {
+            eprintln!("service: gc would drop {name} (idle {age_days}d)");
+            continue;
+        }
+        match store.delete_collection(name) {
+            Ok(()) => {
+                eprintln!("service: gc dropped {name} (idle {age_days}d)");
+                dropped += 1;
+            }
+            Err(e) => eprintln!("service: gc drop {name} failed: {e}"),
+        }
+    }
+    dropped
+}
+
 /// Dispatcher-side handle to a per-root actor thread.
 struct Actor {
     /// Send a debounced batch of `(Evt, PathBuf)` to the actor. Dropping this
@@ -133,15 +196,27 @@ fn actor_loop(
         all_ids.len()
     );
 
-    while let Ok(batch) = rx.recv() {
-        process_changes(
-            &mut store,
-            &*embedder,
-            &root,
-            &batch,
-            &mut path_to_ids,
-            &mut all_ids,
-        );
+    // Stamp the collection so the TTL sweep sees this root as freshly indexed.
+    let _ = store.touch_collection(unix_now());
+
+    loop {
+        match rx.recv_timeout(TOUCH_INTERVAL) {
+            Ok(batch) => {
+                process_changes(
+                    &mut store,
+                    &*embedder,
+                    &root,
+                    &batch,
+                    &mut path_to_ids,
+                    &mut all_ids,
+                );
+                let _ = store.touch_collection(unix_now());
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                let _ = store.touch_collection(unix_now());
+            }
+            Err(RecvTimeoutError::Disconnected) => break,
+        }
     }
 
     eprintln!("service: {} stopped", root.display());
@@ -291,6 +366,7 @@ pub fn run_serve(host: &str, port: u16, ssl: bool, debounce_ms: u64) -> Result<i
     eprintln!("service: watching (roots={})", actors.len());
 
     let mut last_gc = Instant::now();
+    let mut last_sweep = Instant::now();
 
     let exit_code = loop {
         if stop.load(Ordering::Relaxed) {
@@ -312,6 +388,23 @@ pub fn run_serve(host: &str, port: u16, ssl: bool, debounce_ms: u64) -> Result<i
                 eprintln!("service: reconcile failed ({e})");
             }
             last_gc = Instant::now();
+        }
+
+        if last_sweep.elapsed() >= GC_SWEEP_INTERVAL {
+            let ttl: u64 = *crate::config::TTL_SECS;
+            if ttl > 0 {
+                let mut sweep_store = HttpStore::new(&conn.host, conn.port, conn.ssl);
+                let dropped = gc_sweep(
+                    &mut sweep_store,
+                    unix_now(),
+                    ttl,
+                    crate::config::gc_dry_run(),
+                );
+                if dropped > 0 {
+                    eprintln!("service: gc swept {dropped} stale collection(s)");
+                }
+            }
+            last_sweep = Instant::now();
         }
 
         match rx.recv_timeout(Duration::from_millis(200)) {
@@ -507,5 +600,79 @@ mod tests {
         let (start, stop) = reconcile_diff(&[], &current);
         assert!(start.is_empty());
         assert_eq!(stop, vec![PathBuf::from("/a")]);
+    }
+
+    fn ci(name: &str, index_repo: bool, last_indexed: Option<u64>) -> CollectionInfo {
+        CollectionInfo {
+            id: format!("id-{name}"),
+            name: name.to_string(),
+            index_repo,
+            last_indexed,
+        }
+    }
+
+    #[test]
+    fn gc_decide_drops_only_marked_and_stale() {
+        let now = 1_000_000_000u64;
+        let ttl = 30 * 86_400u64;
+        let cols = vec![
+            ci("code-stale", true, Some(now - ttl - 1)),
+            ci("code-fresh", true, Some(now - ttl + 1)),
+            ci("foreign-stale", false, Some(now - ttl - 1)),
+            ci("code-nots", true, None),
+        ];
+        assert_eq!(gc_decide(&cols, now, ttl), vec!["code-stale".to_string()]);
+    }
+
+    #[test]
+    fn gc_decide_boundary_is_kept() {
+        let now = 1_000_000_000u64;
+        let ttl = 100u64;
+        assert!(gc_decide(&[ci("c", true, Some(now - ttl))], now, ttl).is_empty());
+        assert_eq!(
+            gc_decide(&[ci("c", true, Some(now - ttl - 1))], now, ttl),
+            vec!["c".to_string()]
+        );
+    }
+
+    #[test]
+    fn gc_decide_ttl_zero_disables() {
+        let now = 1_000_000_000u64;
+        assert!(gc_decide(&[ci("code-ancient", true, Some(0))], now, 0).is_empty());
+    }
+
+    #[test]
+    fn gc_decide_future_timestamp_kept() {
+        let now = 1_000u64;
+        assert!(gc_decide(&[ci("c", true, Some(now + 10_000))], now, 100).is_empty());
+    }
+
+    #[test]
+    fn gc_sweep_deletes_stale_and_reports_count() {
+        use crate::testkit::MockStore;
+        let now = 1_000_000_000u64;
+        let ttl = 30 * 86_400u64;
+        let cols = vec![
+            ci("code-stale", true, Some(now - ttl - 1)),
+            ci("code-fresh", true, Some(now)),
+            ci("foreign", false, Some(0)),
+        ];
+        let mut store = MockStore::new().with_collections(cols);
+        let dropped = gc_sweep(&mut store, now, ttl, false);
+        assert_eq!(dropped, 1);
+        let left: Vec<String> = store.collections.iter().map(|c| c.name.clone()).collect();
+        assert_eq!(left, vec!["code-fresh".to_string(), "foreign".to_string()]);
+    }
+
+    #[test]
+    fn gc_sweep_dry_run_deletes_nothing() {
+        use crate::testkit::MockStore;
+        let now = 1_000_000_000u64;
+        let ttl = 30 * 86_400u64;
+        let cols = vec![ci("code-stale", true, Some(now - ttl - 1))];
+        let mut store = MockStore::new().with_collections(cols);
+        let dropped = gc_sweep(&mut store, now, ttl, true);
+        assert_eq!(dropped, 0, "dry-run drops nothing");
+        assert_eq!(store.collections.len(), 1, "collection still present");
     }
 }

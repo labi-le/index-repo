@@ -17,6 +17,28 @@ pub static MAX_FILE_BYTES: LazyLock<u64> = LazyLock::new(|| {
 pub const MAX_SEMANTIC_LINES: usize = 200;
 pub const BATCH: usize = 2000;
 
+/// Collection TTL in seconds — the serve daemon GC-drops index_repo-owned
+/// collections not indexed within this window. Overridable via
+/// `INDEX_REPO_TTL_DAYS` (default 30); `0` disables GC.
+pub static TTL_SECS: LazyLock<u64> =
+    LazyLock::new(|| ttl_secs_from(std::env::var("INDEX_REPO_TTL_DAYS").ok().as_deref()));
+
+fn ttl_secs_from(days: Option<&str>) -> u64 {
+    days.and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(30)
+        .saturating_mul(86_400)
+}
+
+/// Whether GC runs in dry-run mode (`INDEX_REPO_GC_DRY_RUN=1|true`): logs what
+/// it would drop without deleting.
+pub fn gc_dry_run() -> bool {
+    flag_enabled(std::env::var("INDEX_REPO_GC_DRY_RUN").ok().as_deref())
+}
+
+fn flag_enabled(v: Option<&str>) -> bool {
+    matches!(v, Some(s) if s == "1" || s.eq_ignore_ascii_case("true"))
+}
+
 /// ChromaDB collection name for a repo `root`.
 ///
 /// Resolution order:
@@ -399,5 +421,27 @@ mod tests {
         git(&["remote", "add", "origin", "git@github.com:acme/Widgets.git"]).unwrap();
         let canon = std::fs::canonicalize(root).unwrap();
         assert_eq!(collection_name(&canon), "code-acme-widgets");
+    }
+
+    #[test]
+    fn ttl_secs_from_defaults_and_parses() {
+        assert_eq!(ttl_secs_from(None), 30 * 86_400, "unset → 30 days");
+        assert_eq!(
+            ttl_secs_from(Some("garbage")),
+            30 * 86_400,
+            "invalid → default"
+        );
+        assert_eq!(ttl_secs_from(Some("7")), 7 * 86_400);
+        assert_eq!(ttl_secs_from(Some("0")), 0, "0 → GC disabled");
+    }
+
+    #[test]
+    fn flag_enabled_recognizes_truthy() {
+        assert!(flag_enabled(Some("1")));
+        assert!(flag_enabled(Some("true")));
+        assert!(flag_enabled(Some("TRUE")));
+        assert!(!flag_enabled(Some("0")));
+        assert!(!flag_enabled(Some("no")));
+        assert!(!flag_enabled(None));
     }
 }

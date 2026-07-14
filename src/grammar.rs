@@ -54,13 +54,6 @@ pub fn used_grammars_str() -> String {
 }
 
 #[cfg(test)]
-pub fn reset_used_grammars() {
-    if let Ok(mut set) = USED_GRAMMARS.lock() {
-        set.clear();
-    }
-}
-
-#[cfg(test)]
 mod tests {
     use super::*;
     use tree_sitter::Parser;
@@ -124,13 +117,13 @@ mod tests {
 
     #[test]
     fn used_grammars_tracking() {
-        reset_used_grammars();
-        assert_eq!(used_grammars_str(), "none");
+        // `USED_GRAMMARS` is a process-global set shared with other (parallel)
+        // tests, so we assert only that this test's own grammars are present
+        // (monotonic inserts) — never emptiness, which would race.
         language_for("rust");
         language_for("python");
         let s = used_grammars_str();
         assert!(s.contains("python"), "got: {s}");
         assert!(s.contains("rust"), "got: {s}");
-        reset_used_grammars();
     }
 }

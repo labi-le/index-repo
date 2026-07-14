@@ -60,9 +60,15 @@ Configured by CLI flags (`--host`, `--port`, `--ssl`, `--collection`,
 | `INDEX_REPO_INTRA_THREADS` | `4` | ONNX intra-op threads. |
 | `INDEX_REPO_EMBED_BATCH` | `32` | Embedding batch size. |
 | `INDEX_REPO_POOLING` | `mean` | Token pooling: `mean` or `cls`. |
+| `INDEX_REPO_TTL_DAYS` | `30` | Serve daemon drops collections not indexed within this many days. `0` disables GC. |
+| `INDEX_REPO_GC_DRY_RUN` | (unset) | `1`/`true` → GC logs what it would drop without deleting. |
 
 Default host is `127.0.0.1`; set `--host` (or NixOS `services.index-repo.host`)
 for a remote ChromaDB.
+
+The `serve` daemon garbage-collects collections whose repo hasn't been indexed
+(opened or edited) in `INDEX_REPO_TTL_DAYS` days (default 30); set `0` to
+disable, or `INDEX_REPO_GC_DRY_RUN=1` to preview.
 
 ### Languages
 

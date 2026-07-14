@@ -225,7 +225,6 @@ mod tests {
 
     #[test]
     fn python_semantic_scope_and_preamble() {
-        crate::grammar::reset_used_grammars();
         let src = include_str!("../tests/fixtures/sample.py");
         let chunks = chunk_file(src, Path::new("sample.py"));
         let types: Vec<&str> = chunks.iter().map(|c| c.2.as_str()).collect();
@@ -264,7 +263,6 @@ mod tests {
 
     #[test]
     fn rust_impl_item_scope() {
-        crate::grammar::reset_used_grammars();
         let src = include_str!("../tests/fixtures/sample.rs");
         let chunks = chunk_file(src, Path::new("sample.rs"));
         let bar = chunks

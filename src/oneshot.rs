@@ -172,6 +172,12 @@ mod tests {
             fn count(&self) -> Result<usize> {
                 self.0.count()
             }
+            fn list_collections(&self) -> Result<Vec<crate::store::CollectionInfo>> {
+                self.0.list_collections()
+            }
+            fn touch_collection(&mut self, now: u64) -> Result<()> {
+                self.0.touch_collection(now)
+            }
         }
 
         let d = tempfile::tempdir().unwrap();

@@ -36,6 +36,19 @@ pub struct Stats {
     pub skipped_bin: usize,
 }
 
+/// A collection as seen by the GC sweep: id, name, and the ownership marker +
+/// last-indexed timestamp parsed from its ChromaDB metadata.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CollectionInfo {
+    pub id: String,
+    pub name: String,
+    /// `metadata.index_repo == true` — set by the indexer; gates GC so foreign
+    /// collections are never dropped.
+    pub index_repo: bool,
+    /// `metadata.last_indexed` (unix seconds); `None` when never stamped.
+    pub last_indexed: Option<u64>,
+}
+
 pub trait Store {
     /// Verify reachability (heartbeat). Used by main for exit code 3.
     fn heartbeat(&self) -> Result<()>;
@@ -63,6 +76,15 @@ pub trait Store {
 
     /// Count records in the current collection.
     fn count(&self) -> Result<usize>;
+
+    /// List all collections with their ownership marker + `last_indexed`
+    /// metadata. Used by the GC sweep.
+    fn list_collections(&self) -> Result<Vec<CollectionInfo>>;
+
+    /// Stamp the current collection's metadata to `{index_repo:true,
+    /// last_indexed:now}`. Overwrites metadata wholesale (ChromaDB semantics);
+    /// the hnsw configuration is untouched.
+    fn touch_collection(&mut self, now: u64) -> Result<()>;
 }
 
 pub trait Embed {

@@ -1,4 +1,4 @@
-use crate::store::{Meta, Record, Store};
+use crate::store::{CollectionInfo, Meta, Record, Store};
 use anyhow::{bail, Result};
 use reqwest::blocking::Client;
 use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION};
@@ -32,6 +32,35 @@ fn auth_header_value(token: &str) -> Option<HeaderValue> {
         return None;
     }
     HeaderValue::from_str(&format!("Bearer {token}")).ok()
+}
+
+/// Parse the ChromaDB list-collections response into `CollectionInfo`s,
+/// extracting the `index_repo` marker and `last_indexed` from each collection's
+/// metadata (absent/null metadata → marker false, timestamp None).
+fn parse_collection_list(v: &Value) -> Vec<CollectionInfo> {
+    let Some(arr) = v.as_array() else {
+        return Vec::new();
+    };
+    arr.iter()
+        .filter_map(|c| {
+            let id = c.get("id")?.as_str()?.to_string();
+            let name = c.get("name")?.as_str()?.to_string();
+            let meta = c.get("metadata");
+            let index_repo = meta
+                .and_then(|m| m.get("index_repo"))
+                .and_then(|b| b.as_bool())
+                .unwrap_or(false);
+            let last_indexed = meta
+                .and_then(|m| m.get("last_indexed"))
+                .and_then(|n| n.as_u64());
+            Some(CollectionInfo {
+                id,
+                name,
+                index_repo,
+                last_indexed,
+            })
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -77,23 +106,6 @@ impl HttpStore {
             collections_path(&self.base),
             self.col_id()?
         ))
-    }
-
-    /// Resolve a collection id by name (used internally by delete_collection).
-    fn fetch_collection_id(&self, name: &str) -> Result<String> {
-        let url = format!("{}/{}", collections_path(&self.base), name);
-        let resp = self.client.get(&url).send()?;
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().unwrap_or_default();
-            bail!("get collection failed: {status} — {body}");
-        }
-        #[derive(Deserialize)]
-        struct ColResp {
-            id: String,
-        }
-        let col: ColResp = resp.json()?;
-        Ok(col.id)
     }
 
     /// Check response status; on failure bail with status + body text.
@@ -146,15 +158,13 @@ impl Store for HttpStore {
         Ok(())
     }
 
-    /// DELETE /collections/{id} — swallow all errors (used by --full-rebuild).
+    /// DELETE /collections/{name} — swallow errors (used by --full-rebuild + GC).
+    ///
+    /// Deletes by NAME, not id: this ChromaDB rejects DELETE-by-id with 404
+    /// (verified against the deployed server), and Python's client deletes by
+    /// name too, so by-name is the parity-correct path.
     fn delete_collection(&mut self, name: &str) -> Result<()> {
-        // Fetch id (may fail if collection doesn't exist — that's fine)
-        let id = match self.fetch_collection_id(name) {
-            Ok(id) => id,
-            Err(_) => return Ok(()), // already gone
-        };
-        let url = format!("{}/{id}", collections_path(&self.base));
-        // Swallow all errors
+        let url = format!("{}/{}", collections_path(&self.base), name);
         let _ = self.client.delete(&url).send();
         self.collection_id = None;
         Ok(())
@@ -280,6 +290,26 @@ impl Store for HttpStore {
         let resp = Self::check(resp)?;
         let text = resp.text()?;
         Ok(text.trim().parse::<usize>()?)
+    }
+
+    /// GET /collections?limit=… → parse id/name/metadata into CollectionInfo.
+    fn list_collections(&self) -> Result<Vec<CollectionInfo>> {
+        let url = format!("{}?limit=100000", collections_path(&self.base));
+        let resp = self.client.get(&url).send()?;
+        let resp = Self::check(resp)?;
+        let v: Value = resp.json()?;
+        Ok(parse_collection_list(&v))
+    }
+
+    /// PUT /collections/{id} {new_metadata:{index_repo:true,last_indexed:now}}.
+    /// Metadata is overwritten wholesale; the hnsw config (separate field) is
+    /// untouched.
+    fn touch_collection(&mut self, now: u64) -> Result<()> {
+        let url = self.col_url()?;
+        let body = json!({ "new_metadata": { "index_repo": true, "last_indexed": now } });
+        let resp = self.client.put(&url).json(&body).send()?;
+        Self::check(resp)?;
+        Ok(())
     }
 }
 
@@ -454,5 +484,43 @@ mod tests {
         assert!(auth_header_value("   ").is_none());
         // A newline is an illegal header byte → auth disabled, not a panic.
         assert!(auth_header_value("bad\ntoken").is_none());
+    }
+
+    // ---- collection-list parsing ----
+
+    #[test]
+    fn parse_collection_list_reads_marker_and_timestamp() {
+        // Shape mirrors the deployed ChromaDB v2 list response (verified live).
+        let v = json!([
+            { "id": "id-a", "name": "code-owner-repo",
+              "metadata": { "index_repo": true, "last_indexed": 1_700_000_000u64 } },
+            { "id": "id-b", "name": "foreign-col", "metadata": { "hnsw:space": "cosine" } },
+            { "id": "id-c", "name": "no-meta", "metadata": null },
+            { "id": "id-d", "name": "marked-no-ts", "metadata": { "index_repo": true } }
+        ]);
+        let got = parse_collection_list(&v);
+        assert_eq!(got.len(), 4);
+        assert_eq!(
+            got[0],
+            CollectionInfo {
+                id: "id-a".into(),
+                name: "code-owner-repo".into(),
+                index_repo: true,
+                last_indexed: Some(1_700_000_000),
+            }
+        );
+        assert!(!got[1].index_repo && got[1].last_indexed.is_none());
+        assert!(!got[2].index_repo && got[2].last_indexed.is_none());
+        assert!(got[3].index_repo && got[3].last_indexed.is_none());
+    }
+
+    // ---- touch (PUT new_metadata) body shape ----
+
+    #[test]
+    fn touch_body_shape() {
+        let body =
+            json!({ "new_metadata": { "index_repo": true, "last_indexed": 1_700_000_000u64 } });
+        assert_eq!(body["new_metadata"]["index_repo"], true);
+        assert_eq!(body["new_metadata"]["last_indexed"], 1_700_000_000u64);
     }
 }
