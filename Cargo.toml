@@ -16,7 +16,7 @@ anyhow = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
-tree-sitter = "0.25"
+tree-sitter = "0.26"
 tree-sitter-python = "0.25"
 tree-sitter-rust = "0.24"
 tree-sitter-go = "0.25"
@@ -25,16 +25,16 @@ tree-sitter-javascript = "0.25"
 tree-sitter-typescript = "0.23"
 tree-sitter-bash = "0.25"
 
-sha1 = "0.10"
+sha1 = "0.11"
 once_cell = "1"
 libc = "0.2"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 ignore = "0.4"
 walkdir = "2"
-notify-debouncer-full = "0.3"
-signal-hook = "0.3"
+notify-debouncer-full = "0.7"
+signal-hook = "0.4"
 clap = { version = "4", features = ["derive"] }
-fastembed = { version = "=5.17.2", default-features = false, features = ["ort-load-dynamic"] }
+fastembed = { version = "=5.17.3", default-features = false, features = ["ort-load-dynamic"] }
 ort = { version = "=2.0.0-rc.12", default-features = false, features = ["load-dynamic"] }
 tree-sitter-java = "0.23.5"
 tree-sitter-c = "0.24.2"

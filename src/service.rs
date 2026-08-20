@@ -14,8 +14,8 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
-use notify_debouncer_full::new_debouncer;
-use notify_debouncer_full::notify::{RecursiveMode, Watcher};
+use notify_debouncer_full::notify::{RecommendedWatcher, RecursiveMode};
+use notify_debouncer_full::{Debouncer, NoCache, new_debouncer};
 
 use crate::chroma::HttpStore;
 use crate::config::manifest_collection_name;
@@ -391,11 +391,11 @@ fn remove_manifest(conn: &Conn, collection: &str, root: &Path) {
 ///
 /// Keys everything by CANONICAL path (`scan()` already returns canonical roots).
 /// The `contains_key` guard guarantees we never spawn two actors for one root.
-fn reconcile<W: Watcher>(
+fn reconcile(
     reg: &Registry,
     conn: &Conn,
     embedder: &Arc<LazyEmbedder>,
-    watcher: &mut W,
+    watcher: &mut Debouncer<RecommendedWatcher, NoCache>,
     actors: &mut HashMap<PathBuf, Actor>,
     specs: &mut HashMap<PathBuf, Ignore>,
     reaper: &mut Vec<JoinHandle<()>>,
@@ -521,10 +521,7 @@ pub fn run_serve(host: &str, port: u16, ssl: bool, debounce_ms: u64) -> Result<i
 
     let roots_dir = reg.roots_dir();
     let _ = std::fs::create_dir_all(&roots_dir);
-    if let Err(e) = debouncer
-        .watcher()
-        .watch(&roots_dir, RecursiveMode::NonRecursive)
-    {
+    if let Err(e) = debouncer.watch(&roots_dir, RecursiveMode::NonRecursive) {
         eprintln!(
             "service: failed to watch registry dir {}: {e}",
             roots_dir.display()
@@ -539,7 +536,7 @@ pub fn run_serve(host: &str, port: u16, ssl: bool, debounce_ms: u64) -> Result<i
         &reg,
         &conn,
         &embedder,
-        debouncer.watcher(),
+        &mut debouncer,
         &mut actors,
         &mut specs,
         &mut reaper,
@@ -562,7 +559,7 @@ pub fn run_serve(host: &str, port: u16, ssl: bool, debounce_ms: u64) -> Result<i
                 &reg,
                 &conn,
                 &embedder,
-                debouncer.watcher(),
+                &mut debouncer,
                 &mut actors,
                 &mut specs,
                 &mut reaper,
@@ -659,7 +656,7 @@ pub fn run_serve(host: &str, port: u16, ssl: bool, debounce_ms: u64) -> Result<i
                         &reg,
                         &conn,
                         &embedder,
-                        debouncer.watcher(),
+                        &mut debouncer,
                         &mut actors,
                         &mut specs,
                         &mut reaper,
@@ -687,7 +684,7 @@ pub fn run_serve(host: &str, port: u16, ssl: bool, debounce_ms: u64) -> Result<i
     };
 
     for (root, actor) in actors.drain() {
-        let _ = debouncer.watcher().unwatch(&root);
+        let _ = debouncer.unwatch(&root);
         let Actor { tx, join, .. } = actor;
         drop(tx);
         let _ = join.join();

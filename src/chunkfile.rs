@@ -4,9 +4,16 @@ use sha1::{Digest, Sha1};
 use std::path::Path;
 
 pub fn chunk_id(rel: &str, line: usize, body: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut hasher = Sha1::new();
     hasher.update(format!("{rel}:{line}:{body}").as_bytes());
-    format!("{:x}", hasher.finalize())
+    let digest = hasher.finalize();
+    let mut out = String::with_capacity(digest.len() * 2);
+    for b in digest {
+        out.push(HEX[(b >> 4) as usize] as char);
+        out.push(HEX[(b & 0x0f) as usize] as char);
+    }
+    out
 }
 
 pub fn lang_field(path: &Path) -> String {
@@ -186,12 +193,9 @@ mod tests {
 
     #[test]
     fn chunk_id_format() {
+        // sha1("sub/dir/foo.rs:42:fn bar() {}"), lowercase hex — pinned against
+        // `printf ... | sha1sum`, independent of the sha1 crate's own formatting.
         let id = chunk_id("sub/dir/foo.rs", 42, "fn bar() {}");
-        let expected = {
-            let mut h = sha1::Sha1::new();
-            sha1::Digest::update(&mut h, b"sub/dir/foo.rs:42:fn bar() {}");
-            format!("{:x}", sha1::Digest::finalize(h))
-        };
-        assert_eq!(id, expected);
+        assert_eq!(id, "f8ba89f238eddeaefe8d6e28a10c9c58fb8bcfbe");
     }
 }
