@@ -2,7 +2,10 @@
 name: "Dependabot Automerge - Action"
 
 on:
-  pull_request_target:
+  workflow_run:
+    workflows: [ "ci" ]
+    types:
+      - completed
 
 permissions:
   contents: write
@@ -12,15 +15,30 @@ jobs:
   auto-merge:
     name: DependabotMerge
     runs-on: ubuntu-latest
-    if: ${{ github.event.pull_request.user.login == 'dependabot[bot]' }}
+    if: >-
+      ${{ github.event.workflow_run.conclusion == 'success'
+      && github.event.workflow_run.event == 'pull_request'
+      && github.event.workflow_run.head_repository.full_name == github.repository }}
     steps:
       - name: Merge the Dependabot PR
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
         run: |
+          set -euo pipefail
+
+          number=$(gh pr list --head "$HEAD_BRANCH" --state open \
+            --json number,author \
+            --jq 'map(select(.author.login == "dependabot[bot]")) | .[0].number // empty')
+
+          if [ -z "$number" ]; then
+            echo "no open dependabot pr for $HEAD_BRANCH, nothing to merge"
+            exit 0
+          fi
+
           for attempt in 1 2 3 4 5; do
-            if gh pr merge --merge "$PR_URL"; then exit 0; fi
+            if gh pr merge --merge "$number"; then exit 0; fi
             sleep $((attempt * 5))
           done
           exit 1
-        env:
-          PR_URL: ${{github.event.pull_request.html_url}}
-          GITHUB_TOKEN: ${{secrets.GITHUB_TOKEN}}

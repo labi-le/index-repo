@@ -15,7 +15,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use notify_debouncer_full::notify::{RecommendedWatcher, RecursiveMode};
-use notify_debouncer_full::{Debouncer, NoCache, new_debouncer};
+use notify_debouncer_full::{new_debouncer, Debouncer, NoCache};
 
 use crate::chroma::HttpStore;
 use crate::config::manifest_collection_name;
