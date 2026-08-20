@@ -20,7 +20,7 @@ jobs:
           fetch-depth: 0
 
       - name: install nix
-        uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
+        uses: DeterminateSystems/nix-installer-action@main
 
       - name: update flake.nix
         env:
@@ -50,7 +50,7 @@ jobs:
 
       - name: create pull request
         id: cpr
-        uses: peter-evans/create-pull-request@5f6978faf089d4d20b00c7766989d076bb2fc7f1 # v8.1.1
+        uses: peter-evans/create-pull-request@v8
         with:
           base: main
           commit-message: "chore: update flake.nix to v${{ env.VERSION }}"
