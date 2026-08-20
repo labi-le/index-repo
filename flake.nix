@@ -8,7 +8,7 @@
       system = "x86_64-linux";
       pkgs = import nixpkgs { inherit system; };
 
-      version = "0.1.3";
+      version = "0.2.0";
       pname = "index-repo";
 
       # ---------------------------------------------------------------------------
@@ -51,7 +51,7 @@
 
         src = pkgs.fetchurl {
           url = "https://github.com/labi-le/index-repo/releases/download/v${version}/index-repo_linux_amd64";
-          hash = "sha256-4wCF9jznLSav8fk97LQWFBcY2iLNdKl0MD5Hoyh8jcI="; # x86_64-linux
+          hash = "sha256-LrgDDw66H0DaEcCKw8TKSTAtDa05Qn2I/yYEKyNcjDA="; # x86_64-linux
         };
 
         dontUnpack = true;
