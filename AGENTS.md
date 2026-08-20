@@ -33,10 +33,16 @@ nix develop --command bash -c 'cargo fmt && cargo clippy -- -D warnings && cargo
   long-lived process (opencode/omp) must hold it. To smoke `serve` with a root:
   `register`, then rename the marker's `.<pid>` suffix to a live PID.
 - **Collection name** = `code-<owner>-<repo>` from the git remote
-  (`config.rs::collection_name`), mirrored byte-for-byte in
-  `hooks/opencode/chroma-gate.ts`. Change one → change both.
+  (`config.rs::collection_name`), **unchanged** and mirrored byte-for-byte in
+  `hooks/opencode/chroma-gate.ts`. Change one → change both. A sidecar
+  `<name>__manifests` collection (`config.rs::manifest_collection_name`) is
+  created automatically for per-root membership; it is NOT queried by
+  `chroma-gate.ts` (agents only ever hit the content collection).
 - **Parity**: v0.1 is byte-for-byte with Python `index_repo.py`. `docs/spec.md
-  §1` is the law; §16 lists the intentional deviations. Don't touch the
+  §1` is the law; §16 lists the intentional deviations. Content parity (chunk
+  id + metadata) is preserved, but membership tracking and pruning deviate:
+  membership lives out of band in the sidecar manifest and a per-root prune
+  defers content deletion to an orphan sweep (spec §16). Don't touch the
   chunk-id / embedding path without updating §16.
 
 ## ChromaDB v2 REST — sharp edges (live server `192.168.1.2:8000`, no auth)

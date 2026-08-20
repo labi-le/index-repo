@@ -109,3 +109,28 @@ impl Embed for FakeEmbed {
         Ok(vec![vec![0.0_f32; 384]; docs.len()])
     }
 }
+
+#[derive(Default)]
+pub(crate) struct MockManifest {
+    pub sets: std::collections::HashMap<String, HashSet<String>>,
+}
+
+impl crate::manifest::ManifestStore for MockManifest {
+    fn get_or_create(&mut self) -> Result<()> {
+        Ok(())
+    }
+    fn read(&self, roothash: &str) -> Result<HashSet<String>> {
+        Ok(self.sets.get(roothash).cloned().unwrap_or_default())
+    }
+    fn write(&mut self, roothash: &str, _root: &str, ids: &HashSet<String>) -> Result<()> {
+        self.sets.insert(roothash.to_string(), ids.clone());
+        Ok(())
+    }
+    fn all_ids(&self) -> Result<HashSet<String>> {
+        Ok(self.sets.values().flatten().cloned().collect())
+    }
+    fn remove(&mut self, roothash: &str) -> Result<()> {
+        self.sets.remove(roothash);
+        Ok(())
+    }
+}

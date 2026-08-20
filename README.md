@@ -70,6 +70,29 @@ The `serve` daemon garbage-collects collections whose repo hasn't been indexed
 (opened or edited) in `INDEX_REPO_TTL_DAYS` days (default 30); set `0` to
 disable, or `INDEX_REPO_GC_DRY_RUN=1` to preview.
 
+### Shared content collection & per-root manifests
+
+The content collection is keyed by git origin (`code-<owner>-<repo>`), so every
+checkout of the same repository — worktrees, clones, CI checkouts — maps to one
+collection. To let those checkouts coexist without deleting each other's chunks,
+membership is tracked **out of band** in a sidecar collection named
+`<content>__manifests`, created automatically. Each root writes only its own
+id-set there; the chunk id and metadata in the content collection stay identical
+to the parity contract.
+
+- **Safe sharing:** identical file content across checkouts collapses to one
+  shared content chunk referenced by several manifests; divergent content keeps
+  distinct chunks. A per-root prune never deletes content directly — it only
+  rewrites that root's manifest.
+- **Orphan GC:** chunks referenced by no manifest are reclaimed by a periodic
+  single-threaded sweep (`content_ids − union(manifests)`). The sweep does
+  nothing while no manifests exist yet, so a fresh collection is never wiped.
+- **Periodic resync:** each root re-runs a full scan on an interval and whenever
+  its `.gitignore` changes, converging membership after out-of-band edits.
+- **Upgrade:** run `index-repo --full-rebuild` once when upgrading to this
+  version. It drops **both** the content collection and its `__manifests`
+  sidecar before reindexing, so old and new membership schemes never mix.
+
 ### Languages
 
 Tree-sitter AST chunking covers **Python, JavaScript, TypeScript, TSX, Rust, Go,

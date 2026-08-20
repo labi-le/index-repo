@@ -311,6 +311,27 @@ pub fn scope_types(lang: &str) -> &'static [&'static str] {
     }
 }
 
+/// Chunk-id count per manifest document; large id-sets split across parts.
+pub const MANIFEST_PART_SIZE: usize = 5000;
+
+/// Sidecar collection holding per-root manifests, kept out of the content
+/// collection so the query path (chroma-mcp) never ranks manifest documents.
+pub fn manifest_collection_name(content: &str) -> String {
+    const SUFFIX: &str = "__manifests";
+    let name = format!("{content}{SUFFIX}");
+    if name.len() <= 63 {
+        return name;
+    }
+    let h: String = Sha1::digest(content.as_bytes())
+        .iter()
+        .take(4)
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    let keep = 63 - SUFFIX.len() - 1 - h.len();
+    let prefix: String = content.chars().take(keep).collect();
+    format!("{prefix}-{h}{SUFFIX}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -407,6 +428,16 @@ mod tests {
         let name = finalize_collection(&"x".repeat(200));
         assert!(name.len() <= 63, "len {} > 63: {name}", name.len());
         assert!(name.starts_with("code-x"));
+    }
+
+    #[test]
+    fn manifest_collection_name_caps_at_63() {
+        let short = manifest_collection_name("code-acme-widgets");
+        assert_eq!(short, "code-acme-widgets__manifests");
+
+        let long = manifest_collection_name(&format!("code-{}", "x".repeat(59)));
+        assert!(long.len() <= 63, "len {} > 63: {long}", long.len());
+        assert!(long.ends_with("__manifests"));
     }
 
     #[test]

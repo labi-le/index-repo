@@ -9,11 +9,15 @@ replacing the per-opencode-session `index-repo --daemon "$PWD"` spawn.
 This is **purely an orchestration layer wrapped around the existing core**.
 Byte-for-byte UNCHANGED and MUST NOT be touched:
 
-- `config`, `splitlines`, `chunk`, `chunkfile` (chunking, IDs, metadata).
+- `config`, `splitlines`, `chunk`, `chunkfile` (chunking, IDs, metadata) — the
+  parity surface stays byte-for-byte identical.
 - `embed::Embedder` (model, ONNX output, 384-d vectors).
-- `store` (Store/Embed traits, HttpStore, collection naming `code-<basename>`).
-- `oneshot::one_shot_index(...)` and `daemon::{process_changes, build_path_to_ids,
-  watch_keep, safe!}` — **reused as-is**, called with the same arguments.
+- `store` (Store/Embed traits, HttpStore, git-identity content collection name).
+- `oneshot::one_shot_index(...)`, `daemon::{process_changes, build_path_to_ids,
+  watch_keep, safe!}` — reused as the per-root primitives. They now also take a
+  `&mut dyn ManifestStore` and drive it alongside the content `Store` (membership
+  reconciliation, §2.1); the chunk/ID/metadata behavior they produce is
+  unchanged.
 
 `daemon::run_daemon` and the existing `--daemon` flat-CLI path remain intact for
 parity tests and manual use. The service does NOT call `run_daemon`; it
@@ -69,13 +73,28 @@ Components:
     actors; `watcher.watch(root, Recursive)` / `unwatch(root)`.
   - debounced fs batch → split by owning root via **longest-prefix match** of the
     event path against active canonical roots; per matched root filter each path
-    with `watch_keep(root, spec, path)` and map `EventKind→Evt`; send
-    `Vec<(Evt, PathBuf)>` to that root's actor channel.
+    with `daemon::keep_event(root, spec, path, evt)` and map `EventKind→Evt`; send
+    `Vec<(Evt, PathBuf)>` to that root's actor channel. `keep_event` lets
+    `Delete`/`Resync` events bypass the extension+ignore filter (so removals and
+    resyncs are never dropped), while `Upsert` still uses `watch_keep`.
+  - a change to the root's `.gitignore` emits an `Evt::Resync` for that root,
+    since the ignore matcher — and therefore file selection — has changed.
+  - **periodic orphan sweep:** for each distinct content collection under the
+    active roots, the dispatcher runs the single-threaded `service::gc_orphans`
+    on an interval, reclaiming `content_ids − union(manifests)`; and it calls the
+    manifest's `remove(roothash)` when a root's actor stops, so a departed
+    checkout stops pinning its chunks.
 - **Indexer actor thread (one per active root):** owns
-  `Indexer { store: HttpStore, root, spec, path_to_ids, all_ids }`. On spawn runs
-  the initial `one_shot_index`; then loop `rx.recv()` batch →
-  `process_changes(&mut store, embedder, &root, &batch, &mut path_to_ids, &mut all_ids)`.
-  Exits on a `Stop` message after draining the current batch.
+  `Indexer { store: HttpStore, manifest: HttpManifest, root, roothash, spec,
+  path_to_ids, all_ids }` — a content `HttpStore` and its sidecar `HttpManifest`
+  side by side. On spawn runs the initial `one_shot_index(&mut store, &mut
+  manifest, embedder, &root, &spec)` (which writes this root's manifest as the
+  `seen` superset before adding content); then loop `rx.recv()` batch →
+  `process_changes(&mut store, &mut manifest, embedder, &root, &roothash, &batch,
+  &mut path_to_ids, &mut all_ids)`. It also re-runs `one_shot_index` on a periodic
+  resync interval and whenever an `Evt::Resync` arrives, converging membership
+  after out-of-band edits or `.gitignore` changes. Exits on a `Stop` message after
+  draining the current batch.
 - **Shared `Arc<LazyEmbedder>`** (§3): passed to every actor as `&dyn Embed`.
 
 Watcher topology — ONE debouncer for all roots (multiple `watch()` calls on a
@@ -91,13 +110,19 @@ the bottleneck regardless).
 
 Pipeline (per batch, per root):
 ```
-fs event → debouncer(coalesce) → dispatcher(route by root + watch_keep + map Evt)
+fs event → debouncer(coalesce) → dispatcher(route by root + keep_event + map Evt)
   → actor channel → process_changes:
-       chunks_for_file (CPU)         [per-root serial]
-     → embed new docs (Mutex<model>) [globally serial]
-     → store.add / store.delete      [per-root HttpStore]
-     → mutate path_to_ids / all_ids  [actor-owned]
+       chunks_for_file (CPU)              [per-root serial]
+     → prune delete-event refs            [manifest + path_to_ids/all_ids]
+     → embed new docs (Mutex<model>)      [globally serial]
+     → manifest.write(superset)           [BEFORE content add]
+     → store.add (never store.delete)     [per-root HttpStore]
+     → mutate path_to_ids / all_ids       [actor-owned]
 ```
+A per-root batch never deletes content chunks: a `Delete` event prunes the exact
+rel and every key under `rel/` (directory removal) from the manifest and in-memory
+maps only. Rewriting the manifest as a superset before the content add keeps the
+orphan sweep from reclaiming a just-added-but-not-yet-referenced chunk.
 
 Race analysis:
 - `path_to_ids`/`all_ids` safe ONLY because each is owned by exactly one actor
@@ -111,6 +136,30 @@ Race analysis:
   its state), drains, exits; watcher `unwatch`es.
 - Initial-sync vs live events: actor processes no batches until its initial
   `one_shot_index` returns; meanwhile events queue. Same ordering as today's daemon.
+
+### 2.1 Per-root manifest reconciliation
+
+The content collection is shared by every checkout of one origin, so each actor
+owns a sidecar `HttpManifest` (collection `<content>__manifests`,
+`config::manifest_collection_name`) that records exactly the chunk ids its root
+references. `read`/`all_ids` take the highest generation per root, so a manifest
+write is observed all-or-nothing; each root is the sole writer of its own rows,
+so there is no cross-writer read-modify-write. Membership is NOT in chunk
+metadata — the chunk id and metadata stay parity-identical (spec §1, §16).
+
+Because deletion is out of the actor hot path, reclaiming chunks referenced by no
+manifest is a dispatcher-owned, single-threaded pass: `service::gc_orphans`
+deletes `content_ids − union(manifests)` in batches, snapshotting content ids
+BEFORE the union and returning 0 (deleting nothing) when the union is empty. That
+empty-union guard prevents wiping a content collection whose manifests have not
+been written yet. The superset-before-add ordering (§2 pipeline) guarantees the
+sweep never races a just-added chunk into an orphan.
+
+Consequences: two checkouts (worktrees/clones) of one origin share the content
+collection safely; identical file content collapses to one shared content doc
+referenced by several manifests, and divergent content keeps distinct coexisting
+ids. When an actor stops, the dispatcher removes that root's manifest so its
+chunks can be reclaimed by the next sweep.
 
 ## 3. Lazy embedder — `LazyEmbedder` implementing `store::Embed`
 

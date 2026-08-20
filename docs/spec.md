@@ -62,6 +62,13 @@ These MUST match the Python exactly:
 `"preamble"` (gap text between semantic nodes), or `"window"` (whole-file
 line-window fallback).
 
+**Membership is out of band.** Per-chunk metadata and the chunk id stay
+byte-identical to the Python contract above — parity is preserved. Which root
+*references* a chunk is NOT recorded in chunk metadata; it lives in a separate
+sidecar manifest collection (see §16). This keeps the content collection
+shareable across checkouts of the same origin without perturbing any parity
+surface.
+
 ---
 
 ## 2. Constants (copy verbatim)
@@ -623,8 +630,9 @@ migrates existing collections.
   (SHA1 of the canonical path). Previously `code-<basename>` alone, which let two
   same-basename repos collide onto one collection and delete each other's chunks.
   The `chroma-gate.ts` plugin mirrors the scheme (including the git lookup).
-  Caveat: two local checkouts of the *same* remote now map to one collection —
-  index only one at a time, or pass `--collection`.
+  Caveat lifted: two local checkouts of the *same* remote share one content
+  collection safely — per-root membership is tracked in a sidecar manifest and
+  no root deletes another's chunks (see the per-root manifest bullet below).
 - **Daemon consistency**: `process_changes` updates in-memory state
   (`all_ids`/`path_to_ids`) only after the ChromaDB add/delete actually
   succeeds; a failed call is retried on the next fs event instead of being
@@ -639,6 +647,34 @@ migrates existing collections.
   `INDEX_REPO_EMBED_BATCH`, `INDEX_REPO_POOLING`, `INDEX_REPO_CHROMA_TOKEN`.
 - **Default host** is `127.0.0.1` (was `192.168.1.2`); set `--host` for remote.
 - **Auth**: `INDEX_REPO_CHROMA_TOKEN` sends `Authorization: Bearer <token>`.
+- **Per-root manifest reconciliation** (shared content collection, out-of-band
+  membership): because a git-identity collection is shared by every checkout of
+  one origin (worktrees, clones), a per-root prune must NOT delete a chunk that
+  another checkout still references. Membership is therefore tracked out of band:
+  - A sidecar collection named `<content>__manifests`
+    (`config::manifest_collection_name`) holds one id-set per root. Each root's
+    set is generation-stamped (`gen` = write time in ms) and split into parts of
+    `MANIFEST_PART_SIZE` ids per document; readers take the highest `gen` for a
+    root, so a write is observed all-or-nothing and stale generations are pruned
+    after the new one lands. A root is the sole writer of its own manifest, so
+    there is no cross-writer read-modify-write.
+  - A per-root prune no longer does a whole-collection set-diff delete against
+    the content collection. It only rewrites that root's manifest (and the
+    actor's in-memory `all_ids`/`path_to_ids`). Reclaiming chunks referenced by
+    no manifest is deferred to a single-threaded orphan sweep
+    (`service::gc_orphans`) computing `content_ids − union(manifests)`. The
+    sweep snapshots the content ids BEFORE taking the manifest union, and is
+    skipped (deletes nothing) when the union is empty — a guard so a
+    not-yet-manifested collection is never wiped.
+  - The manifest is written as a **superset** (`seen` ids) BEFORE any content
+    add, so a concurrent orphan sweep can never delete a just-added chunk that
+    is not yet referenced.
+  - Net effect: multiple checkouts of the same origin share one content
+    collection safely; identical file content across checkouts collapses to one
+    shared content doc referenced by several manifests, while divergent content
+    yields different ids that coexist.
+  - Requires a one-time `--full-rebuild` on deploy, which drops BOTH the content
+    collection and its `<content>__manifests` sidecar before reindexing.
 
 ### Deliberately NOT changed (tradeoffs / external coupling)
 
