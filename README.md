@@ -85,13 +85,25 @@ to the parity contract.
   distinct chunks. A per-root prune never deletes content directly — it only
   rewrites that root's manifest.
 - **Orphan GC:** chunks referenced by no manifest are reclaimed by a periodic
-  single-threaded sweep (`content_ids − union(manifests)`). The sweep does
-  nothing while no manifests exist yet, so a fresh collection is never wiped.
-- **Periodic resync:** each root re-runs a full scan on an interval and whenever
-  its `.gitignore` changes, converging membership after out-of-band edits.
-- **Upgrade:** run `index-repo --full-rebuild` once when upgrading to this
+  single-threaded sweep (`content_ids − union(manifests)`), every 5 minutes. The
+  sweep does nothing while no manifests exist yet, so a fresh collection is never
+  wiped, and on a collection of at least ~100 chunks it also refuses to delete
+  more than half of it at once (a sign the manifests were read incompletely —
+  `--full-rebuild` is the fix). Dropping a collection also drops its
+  `__manifests` sidecar.
+- **Periodic resync:** each root re-runs a full scan every 45 minutes and whenever
+  its `.gitignore` changes, converging membership after out-of-band edits — and
+  restoring anything a failed ChromaDB write left missing.
+- **Upgrade:** run `index-repo --full-rebuild <repo>` once when upgrading to this
   version. It drops **both** the content collection and its `__manifests`
   sidecar before reindexing, so old and new membership schemes never mix.
+  **Stop `serve` first** — `systemctl --user stop index-repo` — and start it again
+  afterwards. A running actor resolves each collection's UUID once and caches it
+  for its lifetime, so if another checkout of the same origin is being watched
+  while the collections are dropped, that actor keeps posting to a UUID that no
+  longer exists: every manifest write 404s, every change batch bails out early,
+  and not even the periodic resync recovers. That root stays unindexed until
+  `serve` is restarted.
 
 ### Languages
 

@@ -340,6 +340,13 @@ opencode exit. No status socket.
      - `path_to_ids[rel] = seen`.
    - if `added>0 || deleted>0` → log `"daemon: live update — added={a}
      deleted={d} chunks={len(all_ids)}"`.
+- Deviation (§16): the shipped `process_changes` no longer deletes content per
+  `rel`, and it does not iterate the batch in map order. It runs **two ordered
+  passes** over the coalesced batch — every delete `rel` first (each pruning the
+  exact path and every path beneath `rel/`), then every upsert `rel`, both sorted
+  — so a path restored in the same debounced batch that removed its parent
+  directory survives. `deleted` is therefore a **net** count: a ref pruned by the
+  delete pass and re-asserted by the upsert pass is not counted.
 - Every ChromaDB call in the daemon is wrapped so a transient backend failure is
   logged (`"daemon: chromadb call failed ({e})"`) and swallowed; the watch loop
   survives.
@@ -633,10 +640,30 @@ migrates existing collections.
   Caveat lifted: two local checkouts of the *same* remote share one content
   collection safely — per-root membership is tracked in a sidecar manifest and
   no root deletes another's chunks (see the per-root manifest bullet below).
-- **Daemon consistency**: `process_changes` updates in-memory state
-  (`all_ids`/`path_to_ids`) only after the ChromaDB add/delete actually
-  succeeds; a failed call is retried on the next fs event instead of being
-  silently marked present (no more index drift on transient failures).
+- **Daemon consistency — membership is committed optimistically**: v0.1-era
+  hardening had `process_changes` update in-memory state only after the ChromaDB
+  call succeeded, so a failed call was retried on the next fs event. That rule is
+  deliberately inverted here, because the per-root manifest bullet below requires
+  the manifest to be a **monotonic superset** of live content: it must be written
+  *before* the content add, and rolling it back on a failed add would reopen the
+  very orphan-sweep race the ordering exists to close. `process_changes` now
+  commits membership — this root's manifest row, then `*all_ids = target` and the
+  new `path_to_ids` entries — independently of the add; `store.add`'s outcome only
+  feeds the returned `added` count.
+  - Consequence: a failed add leaves membership recorded with **no content behind
+    it** — ids pinned in the manifest that the content collection does not hold.
+    Harmless in itself (a pinned id only ever suppresses a delete, it never
+    resurrects a chunk), but it does mean the index can under-report until it is
+    reconciled. Pinned by
+    `daemon::tests::failed_add_records_membership_but_lands_no_content`.
+  - Recovery is the **periodic resync**, not an fs-event retry: `RESYNC_INTERVAL`
+    = 45 min (`src/service.rs`, and the same constant in `src/daemon.rs`) re-runs
+    `one_shot_index`, as does any `Evt::Resync` (e.g. a `.gitignore` change). A
+    retry could not work: since the failed ids are already in `all_ids`, a later
+    event for that unchanged path computes no new records at all.
+  - The one hard stop is a failed *manifest* write: `process_changes` returns
+    `(0, 0)` early, touching neither content nor in-memory state, so that batch is
+    genuinely retried by the next event.
 - **Non-UTF-8 files** are indexed via lossy decode; only files containing NUL
   bytes are treated as binary and skipped (previously any invalid UTF-8 was
   dropped).
@@ -665,16 +692,36 @@ migrates existing collections.
     (`service::gc_orphans`) computing `content_ids − union(manifests)`. The
     sweep snapshots the content ids BEFORE taking the manifest union, and is
     skipped (deletes nothing) when the union is empty — a guard so a
-    not-yet-manifested collection is never wiped.
+    not-yet-manifested collection is never wiped. A second guard caps the orphan
+    share at `ORPHAN_MAX_FRACTION` (50%) of the content collection, on the
+    assumption that a larger share means the manifests were read incompletely;
+    that ratio guard is skipped below `ORPHAN_GUARD_MIN_CONTENT` (100 chunks),
+    where normal churn in a small repo would otherwise block reclaiming forever.
   - The manifest is written as a **superset** (`seen` ids) BEFORE any content
     add, so a concurrent orphan sweep can never delete a just-added chunk that
     is not yet referenced.
+  - A batch is applied in **two ordered passes** (all delete rels, then all upsert
+    rels, each sorted) rather than in map order, because the manifest superset and
+    `path_to_ids` must agree: `path_to_ids` must never claim an id the manifest
+    does not reference, or the orphan sweep reclaims a chunk the actor still
+    believes is present. Ordering deletes first makes a path re-created in the same
+    debounced batch that removed its parent directory end up asserted, not pruned;
+    `deleted` is consequently a net count (a ref pruned then re-asserted in one
+    batch is not counted). See §7 step 6.
   - Net effect: multiple checkouts of the same origin share one content
     collection safely; identical file content across checkouts collapses to one
     shared content doc referenced by several manifests, while divergent content
     yields different ids that coexist.
   - Requires a one-time `--full-rebuild` on deploy, which drops BOTH the content
-    collection and its `<content>__manifests` sidecar before reindexing.
+    collection and its `<content>__manifests` sidecar before reindexing. Stop
+    `serve` first: `HttpStore`/`HttpManifest` resolve a collection UUID once and
+    cache it, so a live actor on another checkout of the same origin would keep
+    posting to the dropped UUID (every manifest write 404s → `process_changes`
+    returns early on every batch) until the daemon is restarted.
+  - The sidecar carries the same `index_repo: true` ownership marker as a content
+    collection, so it is TTL-GC eligible on its own (§17) and the TTL sweep drops
+    a stale collection's sidecar together with the collection itself — membership
+    rows never outlive the chunks they describe.
 
 ### Deliberately NOT changed (tradeoffs / external coupling)
 
@@ -713,9 +760,12 @@ them.
 
 **Sweep** (`service::run_serve`, every `GC_SWEEP_INTERVAL` = 6 h): `gc_decide`
 selects marked collections whose `now - last_indexed > TTL`; each is dropped via
-§8.3 (delete by name). Marked collections without a timestamp are skipped
-(grace). Cross-host safe: any live daemon drops a globally-stale collection, and
-a double delete is a harmless no-op.
+§8.3 (delete by name), together with its `<content>__manifests` sidecar (§16), so
+per-root membership rows never outlive the chunks they describe. The sidecar is
+itself stamped `index_repo: true`, so an orphaned one left behind by an older
+build is still GC-eligible in its own right. Marked collections without a
+timestamp are skipped (grace). Cross-host safe: any live daemon drops a
+globally-stale collection, and a double delete is a harmless no-op.
 
 **Config**: `INDEX_REPO_TTL_DAYS` (default `30`; `0` disables GC),
 `INDEX_REPO_GC_DRY_RUN` (`1`/`true` → log candidates without deleting).

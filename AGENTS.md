@@ -37,13 +37,19 @@ nix develop --command bash -c 'cargo fmt && cargo clippy -- -D warnings && cargo
   `hooks/opencode/chroma-gate.ts`. Change one → change both. A sidecar
   `<name>__manifests` collection (`config.rs::manifest_collection_name`) is
   created automatically for per-root membership; it is NOT queried by
-  `chroma-gate.ts` (agents only ever hit the content collection).
+  `chroma-gate.ts` (agents only ever hit the content collection). The sidecar is
+  stamped `index_repo: true` like a content collection (TTL-GC eligible on its
+  own) and the TTL sweep drops it together with the content collection it belongs
+  to. `--full-rebuild` drops both — **stop `serve` first**, a live actor caches
+  each collection's UUID and would keep posting to the deleted one.
 - **Parity**: v0.1 is byte-for-byte with Python `index_repo.py`. `docs/spec.md
   §1` is the law; §16 lists the intentional deviations. Content parity (chunk
   id + metadata) is preserved, but membership tracking and pruning deviate:
-  membership lives out of band in the sidecar manifest and a per-root prune
-  defers content deletion to an orphan sweep (spec §16). Don't touch the
-  chunk-id / embedding path without updating §16.
+  membership lives out of band in the sidecar manifest, is committed
+  optimistically (a failed content add still records membership; the 45-min
+  resync reconciles, not an fs-event retry), and a per-root prune defers content
+  deletion to an orphan sweep (spec §16). Don't touch the chunk-id / embedding
+  path without updating §16.
 
 ## ChromaDB v2 REST — sharp edges (live server `192.168.1.2:8000`, no auth)
 

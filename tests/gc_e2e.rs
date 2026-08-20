@@ -140,11 +140,13 @@ fn gc_e2e_orphan_reclaimed_referenced_kept() {
     manifest.get_or_create().unwrap();
 
     let dir = tempfile::tempdir().unwrap();
-    std::fs::write(
-        dir.path().join("keep.rs"),
-        "fn keep() {\n    let x = 1;\n    x + 1\n}\n",
-    )
-    .unwrap();
+    // Several kept files, one dropped: the orphan share must sit well under the
+    // ratio guard rather than exactly on it.
+    for i in 0..6 {
+        let a = format!("fn keep_a{i}() {{\n    let x = {i};\n    x + 1\n}}\n");
+        let b = format!("fn keep_b{i}() {{\n    let y = {i};\n    y * 2\n}}\n");
+        std::fs::write(dir.path().join(format!("keep{i}.rs")), a + &b).unwrap();
+    }
     std::fs::write(
         dir.path().join("drop.rs"),
         "fn drop_me() {\n    let y = 2;\n    y * 2\n}\n",
@@ -156,8 +158,8 @@ fn gc_e2e_orphan_reclaimed_referenced_kept() {
 
     let stats = one_shot_index(&mut store, &mut manifest, &FakeEmbed, dir.path(), &spec).unwrap();
     assert!(
-        stats.added >= 2,
-        "both files should chunk; added={}",
+        stats.added >= 7,
+        "every fixture file should chunk; added={}",
         stats.added
     );
 
@@ -184,7 +186,7 @@ fn gc_e2e_orphan_reclaimed_referenced_kept() {
         !orphan_ids.is_empty(),
         "removing drop.rs must leave unreferenced chunks"
     );
-    assert!(!keep_ids.is_empty(), "keep.rs must still be referenced");
+    assert!(!keep_ids.is_empty(), "the kept files stay referenced");
 
     let before_gc = store.existing_ids().unwrap();
     assert!(
@@ -194,6 +196,12 @@ fn gc_e2e_orphan_reclaimed_referenced_kept() {
     assert!(
         keep_ids.iter().all(|id| before_gc.contains(id)),
         "referenced chunks present before the sweep"
+    );
+    assert!(
+        (orphan_ids.len() as f64) < before_gc.len() as f64 * 0.5,
+        "fixture must leave the orphan share under the ratio guard: {}/{}",
+        orphan_ids.len(),
+        before_gc.len()
     );
 
     let reclaimed = gc_orphans(&mut store, &manifest);

@@ -130,6 +130,17 @@ impl HttpManifest {
         Self::check(self.client.post(&url).json(&json!({ "ids": ids })).send()?)?;
         Ok(())
     }
+
+    /// Stamp the ownership marker GC gates on. `get_or_create` does not update
+    /// an existing collection, so sidecars predating the marker need the PUT.
+    /// No `last_indexed` on purpose: an unstamped collection is never
+    /// TTL-dropped, so a sidecar can never age out from under a live writer.
+    fn mark_owned(&self) -> Result<()> {
+        let url = self.col_url()?;
+        let body = json!({ "new_metadata": { "index_repo": true } });
+        Self::check(self.client.put(&url).json(&body).send()?)?;
+        Ok(())
+    }
 }
 
 fn auth_header_value(token: &str) -> Option<HeaderValue> {
@@ -165,7 +176,8 @@ impl ManifestStore for HttpManifest {
         let body = json!({
             "name": self.name,
             "get_or_create": true,
-            "configuration": { "hnsw": { "space": "cosine" } }
+            "configuration": { "hnsw": { "space": "cosine" } },
+            "metadata": { "index_repo": true }
         });
         let resp = Self::check(self.client.post(&url).json(&body).send()?)?;
         #[derive(Deserialize)]
@@ -174,6 +186,7 @@ impl ManifestStore for HttpManifest {
         }
         let col: ColResp = resp.json()?;
         self.collection_id = Some(col.id);
+        let _ = self.mark_owned();
         Ok(())
     }
 

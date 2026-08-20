@@ -79,7 +79,9 @@ pub fn build_path_to_ids(
 /// and the manifest is rewritten as a superset before any content add so a
 /// concurrent orphan sweep never deletes an added-but-unreferenced chunk. A
 /// delete event prunes the exact path and every path beneath it (directory
-/// removal). Returns `(added, deleted_refs)`.
+/// removal); the batch applies every prune before every upsert, so a path
+/// restored in the same batch survives its parent's removal. Returns
+/// `(added, deleted_refs)`.
 #[allow(clippy::too_many_arguments)]
 pub fn process_changes(
     store: &mut dyn Store,
@@ -120,30 +122,41 @@ pub fn process_changes(
     let mut queued: HashSet<String> = HashSet::new();
     let mut deleted: usize = 0;
 
+    // Split so the prune pass cannot land after an upsert for a path beneath a
+    // deleted directory; HashMap order must not decide that.
+    let mut del_rels: Vec<&str> = Vec::new();
+    let mut up_rels: Vec<&str> = Vec::new();
     for (rel, action) in &actions {
-        let path = &paths[rel];
-        let is_delete = matches!(action, Evt::Delete) || !path.exists();
+        if matches!(action, Evt::Delete) || !paths[rel].exists() {
+            del_rels.push(rel);
+        } else {
+            up_rels.push(rel);
+        }
+    }
+    del_rels.sort_unstable();
+    up_rels.sort_unstable();
 
-        if is_delete {
-            let prefix = format!("{rel}/");
-            let matched: Vec<String> = path_to_ids
-                .keys()
-                .filter(|k| k.as_str() == rel || k.starts_with(&prefix))
-                .cloned()
-                .collect();
-            for k in matched {
-                if let Some(ids) = path_to_ids.get(&k) {
-                    for id in ids {
-                        if target.remove(id) {
-                            deleted += 1;
-                        }
+    for rel in del_rels {
+        let prefix = format!("{rel}/");
+        let matched: Vec<String> = path_to_ids
+            .keys()
+            .filter(|k| k.as_str() == rel || k.starts_with(&prefix))
+            .cloned()
+            .collect();
+        for k in matched {
+            if let Some(ids) = path_to_ids.get(&k) {
+                for id in ids {
+                    if target.remove(id) {
+                        deleted += 1;
                     }
                 }
-                removed_rels.push(k);
             }
-            continue;
+            removed_rels.push(k);
         }
+    }
 
+    for rel in up_rels {
+        let path = &paths[rel];
         let (_rel2, records, _ts, _win, ok) = chunks_for_file(path, root);
         if !ok {
             continue;
@@ -157,12 +170,15 @@ pub fn process_changes(
             }
         }
         for r in records {
-            target.insert(r.id.clone());
+            if target.insert(r.id.clone()) && all_ids.contains(&r.id) {
+                // the prune pass dropped this ref; the upsert brings it straight back
+                deleted = deleted.saturating_sub(1);
+            }
             if !all_ids.contains(&r.id) && queued.insert(r.id.clone()) {
                 new_records.push(r);
             }
         }
-        new_path_ids.insert(rel.clone(), seen);
+        new_path_ids.insert(rel.to_string(), seen);
     }
 
     if new_records.is_empty() && deleted == 0 && removed_rels.is_empty() {
@@ -634,6 +650,136 @@ mod tests {
             "manifest empty after subtree prune"
         );
         assert!(mock.deleted.is_empty(), "content never deleted on prune");
+    }
+
+    // ---- A directory Delete and an Upsert beneath it in one batch ----
+
+    /// Index `n` sibling subtrees, each holding one live python file.
+    /// Returns `(rel, path, chunk ids)` per file.
+    fn seed_subtrees(d: &Path, n: usize) -> Vec<(String, PathBuf, HashSet<String>)> {
+        (0..n)
+            .map(|i| {
+                let dir = d.join(format!("sub{i}"));
+                fs::create_dir_all(&dir).unwrap();
+                let f = setup_file(&dir, "a.py", &format!("def f{i}():\n    return {i}\n"));
+                let (rel, records, _, _, ok) = cff(&f, d);
+                assert!(ok && !records.is_empty(), "fixture {rel} must yield chunks");
+                let ids: HashSet<String> = records.iter().map(|r| r.id.clone()).collect();
+                (rel, f, ids)
+            })
+            .collect()
+    }
+
+    fn tracked(
+        seeded: &[(String, PathBuf, HashSet<String>)],
+    ) -> (HashMap<String, HashSet<String>>, HashSet<String>) {
+        let path_to_ids: HashMap<String, HashSet<String>> = seeded
+            .iter()
+            .map(|(rel, _, ids)| (rel.clone(), ids.clone()))
+            .collect();
+        let all_ids: HashSet<String> = path_to_ids.values().flatten().cloned().collect();
+        (path_to_ids, all_ids)
+    }
+
+    #[test]
+    fn dir_delete_with_upsert_beneath_it_keeps_the_file_indexed() {
+        let d = tempfile::tempdir().unwrap();
+        // Eight pairs: under the old HashMap-order loop every directory would
+        // have to precede its own file by chance for this to pass.
+        let seeded = seed_subtrees(d.path(), 8);
+        let (mut path_to_ids, mut all_ids) = tracked(&seeded);
+        let before = all_ids.clone();
+
+        let mut mock = MockStore::new().with_ids(all_ids.clone());
+        let mut manifest = MockManifest::default();
+        manifest.sets.insert(RH.to_string(), all_ids.clone());
+
+        // `rm -rf subN && git checkout subN` inside one debounce window.
+        let mut changes: Vec<(Evt, PathBuf)> = Vec::new();
+        for (_, f, _) in &seeded {
+            changes.push((Evt::Delete, f.parent().unwrap().to_path_buf()));
+            changes.push((Evt::Upsert, f.clone()));
+        }
+
+        let (added, deleted) = process_changes(
+            &mut mock,
+            &mut manifest,
+            &FakeEmbed,
+            d.path(),
+            RH,
+            &changes,
+            &mut path_to_ids,
+            &mut all_ids,
+        );
+
+        assert_eq!(added, 0, "the restored content is already in the store");
+        assert_eq!(
+            deleted, 0,
+            "every pruned ref is restored by the upsert in the same batch"
+        );
+        assert_eq!(all_ids, before, "no live id may leave this root's set");
+
+        let manifest_ids = manifest.read(RH).unwrap();
+        for (rel, _, ids) in &seeded {
+            let live = path_to_ids
+                .get(rel)
+                .unwrap_or_else(|| panic!("{rel} must still be tracked"));
+            assert_eq!(live, ids, "{rel} keeps its chunk ids");
+            for id in ids {
+                assert!(
+                    manifest_ids.contains(id),
+                    "path_to_ids claims id {id} of {rel}, so the manifest must \
+                     reference it or the orphan sweep will delete the chunk"
+                );
+                assert!(mock.ids.contains(id), "id {id} of {rel} survives in store");
+            }
+        }
+        assert!(mock.deleted.is_empty(), "content never deleted on prune");
+    }
+
+    #[test]
+    fn dir_delete_alone_prunes_the_subtree() {
+        let d = tempfile::tempdir().unwrap();
+        let seeded = seed_subtrees(d.path(), 2);
+        let (mut path_to_ids, mut all_ids) = tracked(&seeded);
+        let before = all_ids.clone();
+
+        let mut mock = MockStore::new().with_ids(all_ids.clone());
+        let mut manifest = MockManifest::default();
+        manifest.sets.insert(RH.to_string(), all_ids.clone());
+
+        // The same fixture minus the upserts: nothing re-asserts the files, so
+        // the subtree prune stands even though they are still on disk.
+        let changes: Vec<(Evt, PathBuf)> = seeded
+            .iter()
+            .map(|(_, f, _)| (Evt::Delete, f.parent().unwrap().to_path_buf()))
+            .collect();
+
+        let (added, deleted) = process_changes(
+            &mut mock,
+            &mut manifest,
+            &FakeEmbed,
+            d.path(),
+            RH,
+            &changes,
+            &mut path_to_ids,
+            &mut all_ids,
+        );
+
+        assert_eq!(added, 0, "a prune adds nothing");
+        assert_eq!(deleted, before.len(), "every ref beneath subN is dropped");
+        assert!(all_ids.is_empty(), "the root references nothing");
+        for (rel, _, _) in &seeded {
+            assert!(!path_to_ids.contains_key(rel), "{rel} is untracked");
+        }
+        assert!(
+            manifest.read(RH).unwrap().is_empty(),
+            "manifest empty after subtree prune"
+        );
+        assert!(mock.deleted.is_empty(), "content never deleted on prune");
+        for id in &before {
+            assert!(mock.ids.contains(id), "chunk {id} survives for the sweep");
+        }
     }
 
     // ---- Upsert after a rechunk drops the stale ids from this root ----
