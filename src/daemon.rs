@@ -12,7 +12,7 @@ use crate::store::{Embed, Record, Store};
 use crate::walk::Ignore;
 use anyhow::Result;
 use notify_debouncer_full::new_debouncer;
-use notify_debouncer_full::notify::{EventKind, RecursiveMode, Watcher};
+use notify_debouncer_full::notify::{EventKind, RecursiveMode};
 
 pub enum Evt {
     Delete,
@@ -282,7 +282,7 @@ pub fn run_daemon(
         }
     };
 
-    if let Err(e) = debouncer.watcher().watch(root, RecursiveMode::Recursive) {
+    if let Err(e) = debouncer.watch(root, RecursiveMode::Recursive) {
         eprintln!("daemon: watch loop crashed ({e})");
         return Ok(4);
     }

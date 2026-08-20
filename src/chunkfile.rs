@@ -193,12 +193,9 @@ mod tests {
 
     #[test]
     fn chunk_id_format() {
+        // sha1("sub/dir/foo.rs:42:fn bar() {}"), lowercase hex — pinned against
+        // `printf ... | sha1sum`, independent of the sha1 crate's own formatting.
         let id = chunk_id("sub/dir/foo.rs", 42, "fn bar() {}");
-        let expected = {
-            let mut h = sha1::Sha1::new();
-            sha1::Digest::update(&mut h, b"sub/dir/foo.rs:42:fn bar() {}");
-            format!("{:x}", sha1::Digest::finalize(h))
-        };
-        assert_eq!(id, expected);
+        assert_eq!(id, "f8ba89f238eddeaefe8d6e28a10c9c58fb8bcfbe");
     }
 }
