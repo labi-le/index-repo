@@ -77,8 +77,11 @@ Components:
     `Vec<(Evt, PathBuf)>` to that root's actor channel. `keep_event` lets
     `Delete`/`Resync` events bypass the extension+ignore filter (so removals and
     resyncs are never dropped), while `Upsert` still uses `watch_keep`.
-  - a change to the root's `.gitignore` emits an `Evt::Resync` for that root,
-    since the ignore matcher — and therefore file selection — has changed.
+  - a **mutation** of the root's `.gitignore` (`Create`/`Modify`/`Remove`, per
+    `evt_for`) emits an `Evt::Resync` for that root, since the ignore matcher —
+    and therefore file selection — has changed. `Access` events are filtered by
+    `gitignore_reload_root`: the resync walk reads `.gitignore` itself, so
+    treating reads as changes makes every resync schedule the next one.
   - **periodic orphan sweep:** for each distinct content collection under the
     active roots, the dispatcher runs the single-threaded `service::gc_orphans`
     every `ORPHAN_GC_INTERVAL` (5 min), reclaiming

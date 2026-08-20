@@ -14,7 +14,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
-use notify_debouncer_full::notify::{RecommendedWatcher, RecursiveMode};
+use notify_debouncer_full::notify::{EventKind, RecommendedWatcher, RecursiveMode};
 use notify_debouncer_full::{new_debouncer, Debouncer, NoCache};
 
 use crate::chroma::HttpStore;
@@ -72,11 +72,27 @@ pub fn route_all<'a>(path: &Path, roots: &'a [PathBuf]) -> Vec<&'a PathBuf> {
     roots.iter().filter(|r| path.starts_with(r)).collect()
 }
 
-/// If `path` is a registered root's OWN `.gitignore`, return that root.
+/// If `path` is a registered root's OWN `.gitignore` AND `kind` is a mutation,
+/// return that root.
 ///
 /// Only a root's direct `.gitignore` triggers a live reload; nested
 /// `.gitignore`s are intentionally ignored to preserve single-file selection
 /// parity with Python (spec §5.1).
+///
+/// The `kind` filter is load-bearing, not cosmetic: the resync walk this
+/// reload schedules reads `<root>/.gitignore` itself, so honoring inotify
+/// `Access` events here makes every resync schedule the next one — a 1 Hz
+/// reindex loop across every registered root (observed at 65% CPU).
+pub fn gitignore_reload_root<'a>(
+    path: &Path,
+    kind: &EventKind,
+    roots: &'a [PathBuf],
+) -> Option<&'a PathBuf> {
+    evt_for(kind)?;
+    gitignore_root(path, roots)
+}
+
+/// If `path` is a registered root's OWN `.gitignore`, return that root.
 pub fn gitignore_root<'a>(path: &Path, roots: &'a [PathBuf]) -> Option<&'a PathBuf> {
     if path.file_name().and_then(|n| n.to_str()) != Some(".gitignore") {
         return None;
@@ -624,7 +640,7 @@ pub fn run_serve(host: &str, port: u16, ssl: bool, debounce_ms: u64) -> Result<i
                             registry_changed = true;
                             continue;
                         }
-                        if let Some(root) = gitignore_root(path, &active_roots) {
+                        if let Some(root) = gitignore_reload_root(path, &kind, &active_roots) {
                             specs.insert(root.clone(), load_ignore(root));
                             groups
                                 .entry(root.clone())
@@ -780,6 +796,35 @@ mod tests {
             gitignore_root(Path::new("/other/.gitignore"), &roots),
             None,
             "a .gitignore whose parent is not a registered root is ignored"
+        );
+    }
+
+    #[test]
+    fn gitignore_reload_ignores_reads_and_honors_mutations() {
+        use notify_debouncer_full::notify::event::{AccessKind, ModifyKind, RemoveKind};
+        let roots = vec![PathBuf::from("/repo")];
+        let gi = Path::new("/repo/.gitignore");
+        // A read must never schedule a resync: the resync walk reads .gitignore
+        // itself, so honoring Access here loops forever.
+        assert_eq!(
+            gitignore_reload_root(gi, &EventKind::Access(AccessKind::Any), &roots),
+            None,
+            "an Access event on .gitignore is not a reload trigger"
+        );
+        assert_eq!(
+            gitignore_reload_root(gi, &EventKind::Any, &roots),
+            None,
+            "an unclassified event is not a reload trigger"
+        );
+        assert_eq!(
+            gitignore_reload_root(gi, &EventKind::Modify(ModifyKind::Any), &roots),
+            Some(&PathBuf::from("/repo")),
+            "a modification reloads the spec"
+        );
+        assert_eq!(
+            gitignore_reload_root(gi, &EventKind::Remove(RemoveKind::File), &roots),
+            Some(&PathBuf::from("/repo")),
+            "deleting .gitignore reloads the spec (everything becomes eligible)"
         );
     }
 
