@@ -31,7 +31,7 @@ libc = "0.2"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 ignore = "0.4"
 walkdir = "2"
-notify-debouncer-full = "0.3"
+notify-debouncer-full = "0.7"
 signal-hook = "0.4"
 clap = { version = "4", features = ["derive"] }
 fastembed = { version = "=5.17.3", default-features = false, features = ["ort-load-dynamic"] }
