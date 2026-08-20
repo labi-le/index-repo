@@ -18,11 +18,13 @@ use notify_debouncer_full::notify::{RecommendedWatcher, RecursiveMode};
 use notify_debouncer_full::{Debouncer, NoCache, new_debouncer};
 
 use crate::chroma::HttpStore;
-use crate::daemon::{build_path_to_ids, evt_for, process_changes, watch_keep, Evt};
+use crate::config::manifest_collection_name;
+use crate::daemon::{build_path_to_ids, evt_for, keep_event, process_changes, Evt};
 use crate::lazy::LazyEmbedder;
+use crate::manifest::{HttpManifest, ManifestStore};
 use crate::oneshot::one_shot_index;
 use crate::registry::Registry;
-use crate::store::{CollectionInfo, Store};
+use crate::store::{CollectionInfo, Embed, Store};
 use crate::walk::{load_ignore, Ignore};
 
 const GC_INTERVAL: Duration = Duration::from_secs(30);
@@ -30,7 +32,8 @@ const GC_INTERVAL: Duration = Duration::from_secs(30);
 /// active actor re-stamps its collection so an open-but-idle repo never ages
 /// out (and other indexer hosts see it as fresh).
 const GC_SWEEP_INTERVAL: Duration = Duration::from_secs(6 * 3600);
-const TOUCH_INTERVAL: Duration = Duration::from_secs(6 * 3600);
+const RESYNC_INTERVAL: Duration = Duration::from_secs(45 * 60);
+const ORPHAN_GC_INTERVAL: Duration = Duration::from_secs(5 * 60);
 
 /// Current unix time in seconds (0 if the clock predates the epoch).
 fn unix_now() -> u64 {
@@ -119,8 +122,9 @@ pub fn gc_decide(collections: &[CollectionInfo], now: u64, ttl_secs: u64) -> Vec
         .collect()
 }
 
-/// List collections and drop those `gc_decide` selects. Returns the number
-/// actually dropped. `dry_run` logs candidates without deleting.
+/// List collections and drop those `gc_decide` selects, each together with its
+/// manifest sidecar. Returns the number of content collections actually
+/// dropped. `dry_run` logs candidates without deleting.
 fn gc_sweep(store: &mut dyn Store, now: u64, ttl_secs: u64, dry_run: bool) -> usize {
     let collections = match store.list_collections() {
         Ok(c) => c,
@@ -146,6 +150,14 @@ fn gc_sweep(store: &mut dyn Store, now: u64, ttl_secs: u64, dry_run: bool) -> us
             Ok(()) => {
                 eprintln!("service: gc dropped {name} (idle {age_days}d)");
                 dropped += 1;
+                // The sidecar would otherwise outlive its content collection,
+                // and every abandoned root's manifest would keep pinning ids
+                // against a later rebuild.
+                let sidecar = manifest_collection_name(name);
+                match store.delete_collection(&sidecar) {
+                    Ok(()) => eprintln!("service: gc dropped sidecar {sidecar}"),
+                    Err(e) => eprintln!("service: gc drop {sidecar} failed: {e}"),
+                }
             }
             Err(e) => eprintln!("service: gc drop {name} failed: {e}"),
         }
@@ -153,12 +165,103 @@ fn gc_sweep(store: &mut dyn Store, now: u64, ttl_secs: u64, dry_run: bool) -> us
     dropped
 }
 
+/// Refuse to reclaim more than this share of a content collection in one sweep:
+/// a manifest union that thin is far more likely to be incomplete than the
+/// content to be that stale.
+const ORPHAN_MAX_FRACTION: f64 = 0.5;
+/// Content-collection size below which [`ORPHAN_MAX_FRACTION`] is not applied.
+/// On a small repo, deleting two of three files is ordinary rather than
+/// suspicious, and a pure ratio would refuse that reclaim forever.
+const ORPHAN_GUARD_MIN_CONTENT: usize = 100;
+
+/// Delete content chunks referenced by no manifest. Snapshots content ids
+/// BEFORE the manifest union, so a chunk a concurrent actor is adding (which
+/// writes its manifest first) is never mistaken for an orphan. Skips deletion
+/// entirely when the union is empty — a fresh or not-yet-manifested collection
+/// must never be nuked. Returns the number of chunks deleted.
+pub fn gc_orphans(content: &mut dyn Store, manifest: &dyn ManifestStore) -> usize {
+    let content_ids = match content.existing_ids() {
+        Ok(ids) => ids,
+        Err(e) => {
+            eprintln!("service: orphan gc existing_ids failed: {e}");
+            return 0;
+        }
+    };
+    let union = match manifest.all_ids() {
+        Ok(ids) => ids,
+        Err(e) => {
+            eprintln!("service: orphan gc manifest union failed: {e}");
+            return 0;
+        }
+    };
+    if union.is_empty() {
+        return 0;
+    }
+    let orphans: Vec<String> = content_ids.difference(&union).cloned().collect();
+
+    if content_ids.len() >= ORPHAN_GUARD_MIN_CONTENT
+        && orphans.len() as f64 > content_ids.len() as f64 * ORPHAN_MAX_FRACTION
+    {
+        eprintln!(
+            "service: orphan gc refusing to delete {}/{} chunks (>{:.0}%) — manifests likely incomplete; run --full-rebuild before starting serve",
+            orphans.len(),
+            content_ids.len(),
+            ORPHAN_MAX_FRACTION * 100.0
+        );
+        return 0;
+    }
+
+    let mut deleted = 0usize;
+    for chunk in orphans.chunks(crate::config::BATCH) {
+        match content.delete(chunk) {
+            Ok(n) => deleted += n,
+            Err(e) => eprintln!("service: orphan gc delete failed: {e}"),
+        }
+    }
+    deleted
+}
+
+/// Re-scan a root: rebuild content, manifest, and in-memory maps from scratch.
+/// The safety net for events the watcher never delivered (queue overflow, edits
+/// while unwatched, `.gitignore` transitions).
+#[allow(clippy::too_many_arguments)]
+fn resync(
+    store: &mut dyn Store,
+    manifest: &mut dyn ManifestStore,
+    embedder: &dyn Embed,
+    root: &Path,
+    spec: &Ignore,
+    roothash: &str,
+    path_to_ids: &mut HashMap<String, HashSet<String>>,
+    all_ids: &mut HashSet<String>,
+) {
+    match one_shot_index(store, manifest, embedder, root, spec) {
+        Ok(_) => {
+            let my_ids = manifest.read(roothash).unwrap_or_default();
+            *path_to_ids = build_path_to_ids(store, &my_ids);
+            *all_ids = my_ids;
+        }
+        Err(e) => eprintln!("service: {} resync failed: {e}", root.display()),
+    }
+}
+
+/// Dispatcher → actor message.
+enum Msg {
+    /// A debounced batch of watcher events.
+    Batch(Vec<(Evt, PathBuf)>),
+    /// The root was deregistered: drop its manifest and exit. Serialized behind
+    /// any in-flight batch, so the actor's own writes can never resurrect the
+    /// manifest afterwards — which a dispatcher-side delete could not prevent.
+    Retire,
+}
+
 /// Dispatcher-side handle to a per-root actor thread.
 struct Actor {
-    /// Send a debounced batch of `(Evt, PathBuf)` to the actor. Dropping this
-    /// sender closes the channel → the actor drains and exits (Stop signal).
-    tx: Sender<Vec<(Evt, PathBuf)>>,
+    /// Dropping this sender closes the channel → the actor drains and exits
+    /// (daemon shutdown), keeping its manifest.
+    tx: Sender<Msg>,
     join: JoinHandle<()>,
+    collection: String,
 }
 
 /// Per-root actor thread body. Owns its `HttpStore`, `path_to_ids`, `all_ids`.
@@ -168,17 +271,31 @@ fn actor_loop(
     collection: String,
     conn: Conn,
     embedder: Arc<LazyEmbedder>,
-    rx: Receiver<Vec<(Evt, PathBuf)>>,
+    rx: Receiver<Msg>,
 ) {
     let mut store = HttpStore::new(&conn.host, conn.port, conn.ssl);
     if let Err(e) = store.get_or_create(&collection) {
         eprintln!("service: {} get_or_create failed: {e}", root.display());
         return;
     }
+    let mut manifest = HttpManifest::new(
+        &conn.host,
+        conn.port,
+        conn.ssl,
+        &manifest_collection_name(&collection),
+    );
+    if let Err(e) = manifest.get_or_create() {
+        eprintln!(
+            "service: {} manifest get_or_create failed: {e}",
+            root.display()
+        );
+        return;
+    }
 
+    let roothash = Registry::hash(&root);
     let spec = load_ignore(&root);
 
-    let stats = match one_shot_index(&mut store, &*embedder, &root, &spec) {
+    let stats = match one_shot_index(&mut store, &mut manifest, &*embedder, &root, &spec) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("service: {} initial sync failed: {e}", root.display());
@@ -186,8 +303,8 @@ fn actor_loop(
         }
     };
 
-    let mut path_to_ids = build_path_to_ids(&store);
-    let mut all_ids: HashSet<String> = path_to_ids.values().flatten().cloned().collect();
+    let mut all_ids: HashSet<String> = manifest.read(&roothash).unwrap_or_default();
+    let mut path_to_ids = build_path_to_ids(&store, &all_ids);
 
     eprintln!(
         "service: {} synced files={} chunks={}",
@@ -196,23 +313,53 @@ fn actor_loop(
         all_ids.len()
     );
 
-    // Stamp the collection so the TTL sweep sees this root as freshly indexed.
     let _ = store.touch_collection(unix_now());
 
     loop {
-        match rx.recv_timeout(TOUCH_INTERVAL) {
-            Ok(batch) => {
-                process_changes(
+        match rx.recv_timeout(RESYNC_INTERVAL) {
+            Ok(Msg::Batch(batch)) => {
+                if batch.iter().any(|(e, _)| matches!(e, Evt::Resync)) {
+                    resync(
+                        &mut store,
+                        &mut manifest,
+                        &*embedder,
+                        &root,
+                        &spec,
+                        &roothash,
+                        &mut path_to_ids,
+                        &mut all_ids,
+                    );
+                } else {
+                    process_changes(
+                        &mut store,
+                        &mut manifest,
+                        &*embedder,
+                        &root,
+                        &roothash,
+                        &batch,
+                        &mut path_to_ids,
+                        &mut all_ids,
+                    );
+                }
+                let _ = store.touch_collection(unix_now());
+            }
+            Ok(Msg::Retire) => {
+                if let Err(e) = manifest.remove(&roothash) {
+                    eprintln!("service: {} manifest remove failed: {e}", root.display());
+                }
+                break;
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                resync(
                     &mut store,
+                    &mut manifest,
                     &*embedder,
                     &root,
-                    &batch,
+                    &spec,
+                    &roothash,
                     &mut path_to_ids,
                     &mut all_ids,
                 );
-                let _ = store.touch_collection(unix_now());
-            }
-            Err(RecvTimeoutError::Timeout) => {
                 let _ = store.touch_collection(unix_now());
             }
             Err(RecvTimeoutError::Disconnected) => break,
@@ -220,6 +367,24 @@ fn actor_loop(
     }
 
     eprintln!("service: {} stopped", root.display());
+}
+
+/// Delete a departed root's manifest rows from the dispatcher. Only safe when
+/// the root's actor is gone: a live actor is the sole writer of those rows and
+/// would resurrect them with its next write.
+fn remove_manifest(conn: &Conn, collection: &str, root: &Path) {
+    let mut manifest = HttpManifest::new(
+        &conn.host,
+        conn.port,
+        conn.ssl,
+        &manifest_collection_name(collection),
+    );
+    if manifest.get_or_create().is_err() {
+        return;
+    }
+    if let Err(e) = manifest.remove(&Registry::hash(root)) {
+        eprintln!("service: {} manifest remove failed: {e}", root.display());
+    }
 }
 
 /// Bring the running actor set in line with the registry's desired roots.
@@ -242,7 +407,7 @@ fn reconcile(
         .collect();
     for root in dead {
         if let Some(actor) = actors.remove(&root) {
-            let Actor { tx, join } = actor;
+            let Actor { tx, join, .. } = actor;
             drop(tx);
             reaper.push(join);
         }
@@ -259,11 +424,18 @@ fn reconcile(
 
     for root in to_stop {
         if let Some(actor) = actors.remove(&root) {
-            let Actor { tx, join } = actor;
+            let Actor {
+                tx,
+                join,
+                collection,
+            } = actor;
+            let retiring = tx.send(Msg::Retire).is_ok();
             drop(tx);
-            // Defer the join to the reaper instead of joining here: a mid-embed
-            // or slow-HTTP actor would otherwise stall the whole dispatcher loop.
             reaper.push(join);
+            if !retiring {
+                // The actor is already gone, so no writer can race the delete.
+                remove_manifest(conn, &collection, &root);
+            }
         }
         specs.remove(&root);
         let _ = watcher.unwatch(&root);
@@ -283,13 +455,22 @@ fn reconcile(
             .cloned()
             .unwrap_or_else(|| crate::config::fallback_collection_name(&root));
 
-        let (tx, actor_rx) = channel::<Vec<(Evt, PathBuf)>>();
+        let (tx, actor_rx) = channel::<Msg>();
         let emb = Arc::clone(embedder);
         let root_thread = root.clone();
         let conn_thread = conn.clone();
-        let join =
-            thread::spawn(move || actor_loop(root_thread, collection, conn_thread, emb, actor_rx));
-        actors.insert(root.clone(), Actor { tx, join });
+        let join = thread::spawn({
+            let collection = collection.clone();
+            move || actor_loop(root_thread, collection, conn_thread, emb, actor_rx)
+        });
+        actors.insert(
+            root.clone(),
+            Actor {
+                tx,
+                join,
+                collection,
+            },
+        );
 
         if let Err(e) = watcher.watch(&root, RecursiveMode::Recursive) {
             eprintln!("service: failed to watch {}: {e}", root.display());
@@ -364,6 +545,7 @@ pub fn run_serve(host: &str, port: u16, ssl: bool, debounce_ms: u64) -> Result<i
 
     let mut last_gc = Instant::now();
     let mut last_sweep = Instant::now();
+    let mut last_orphan_gc = Instant::now();
 
     let exit_code = loop {
         if stop.load(Ordering::Relaxed) {
@@ -404,6 +586,31 @@ pub fn run_serve(host: &str, port: u16, ssl: bool, debounce_ms: u64) -> Result<i
             last_sweep = Instant::now();
         }
 
+        if last_orphan_gc.elapsed() >= ORPHAN_GC_INTERVAL {
+            let collections: HashSet<String> =
+                actors.values().map(|a| a.collection.clone()).collect();
+            for name in collections {
+                let mut content = HttpStore::new(&conn.host, conn.port, conn.ssl);
+                if content.get_or_create(&name).is_err() {
+                    continue;
+                }
+                let mut manifest = HttpManifest::new(
+                    &conn.host,
+                    conn.port,
+                    conn.ssl,
+                    &manifest_collection_name(&name),
+                );
+                if manifest.get_or_create().is_err() {
+                    continue;
+                }
+                let deleted = gc_orphans(&mut content, &manifest);
+                if deleted > 0 {
+                    eprintln!("service: orphan gc reclaimed {deleted} chunk(s) from {name}");
+                }
+            }
+            last_orphan_gc = Instant::now();
+        }
+
         match rx.recv_timeout(Duration::from_millis(200)) {
             Ok(Ok(events)) => {
                 let mut registry_changed = false;
@@ -419,6 +626,10 @@ pub fn run_serve(host: &str, port: u16, ssl: bool, debounce_ms: u64) -> Result<i
                         }
                         if let Some(root) = gitignore_root(path, &active_roots) {
                             specs.insert(root.clone(), load_ignore(root));
+                            groups
+                                .entry(root.clone())
+                                .or_default()
+                                .push((Evt::Resync, root.clone()));
                             eprintln!("service: reloaded .gitignore for {}", root.display());
                             continue;
                         }
@@ -426,12 +637,12 @@ pub fn run_serve(host: &str, port: u16, ssl: bool, debounce_ms: u64) -> Result<i
                             let Some(spec) = specs.get(root) else {
                                 continue;
                             };
-                            if !watch_keep(root, spec, path) {
-                                continue;
-                            }
                             let Some(evt) = evt_for(&kind) else {
                                 continue;
                             };
+                            if !keep_event(root, spec, path, &evt) {
+                                continue;
+                            }
                             groups
                                 .entry(root.clone())
                                 .or_default()
@@ -457,7 +668,7 @@ pub fn run_serve(host: &str, port: u16, ssl: bool, debounce_ms: u64) -> Result<i
 
                 for (root, batch) in groups {
                     if let Some(actor) = actors.get(&root) {
-                        let _ = actor.tx.send(batch);
+                        let _ = actor.tx.send(Msg::Batch(batch));
                     }
                 }
             }
@@ -474,7 +685,7 @@ pub fn run_serve(host: &str, port: u16, ssl: bool, debounce_ms: u64) -> Result<i
 
     for (root, actor) in actors.drain() {
         let _ = debouncer.unwatch(&root);
-        let Actor { tx, join } = actor;
+        let Actor { tx, join, .. } = actor;
         drop(tx);
         let _ = join.join();
     }
@@ -671,5 +882,137 @@ mod tests {
         let dropped = gc_sweep(&mut store, now, ttl, true);
         assert_eq!(dropped, 0, "dry-run drops nothing");
         assert_eq!(store.collections.len(), 1, "collection still present");
+    }
+
+    #[test]
+    fn gc_sweep_drops_the_sidecar_of_a_dropped_collection() {
+        use crate::testkit::MockStore;
+        let now = 1_000_000_000u64;
+        let ttl = 30 * 86_400u64;
+        let cols = vec![
+            ci("code-stale", true, Some(now - ttl - 1)),
+            ci(&manifest_collection_name("code-stale"), true, None),
+            ci("code-fresh", true, Some(now)),
+            ci(&manifest_collection_name("code-fresh"), true, None),
+        ];
+        let mut store = MockStore::new().with_collections(cols);
+        assert_eq!(gc_sweep(&mut store, now, ttl, false), 1);
+        let left: Vec<String> = store.collections.iter().map(|c| c.name.clone()).collect();
+        assert_eq!(
+            left,
+            vec![
+                "code-fresh".to_string(),
+                manifest_collection_name("code-fresh")
+            ],
+            "a dropped collection takes its sidecar with it, and only its own"
+        );
+    }
+
+    fn chunk_ids(range: std::ops::Range<usize>) -> Vec<String> {
+        range.map(|i| format!("chunk-{i:04}")).collect()
+    }
+
+    fn manifest_with(sets: &[(&str, Vec<String>)]) -> crate::testkit::MockManifest {
+        let mut manifest = crate::testkit::MockManifest::default();
+        for (root, ids) in sets {
+            manifest
+                .sets
+                .insert((*root).to_string(), ids.iter().cloned().collect());
+        }
+        manifest
+    }
+
+    #[test]
+    fn gc_orphans_empty_union_deletes_nothing() {
+        use crate::testkit::{MockManifest, MockStore};
+        let mut store = MockStore::new().with_ids(chunk_ids(0..5));
+        assert_eq!(
+            gc_orphans(&mut store, &MockManifest::default()),
+            0,
+            "an empty union means unmanifested, not orphaned"
+        );
+        assert!(store.deleted.is_empty());
+        assert_eq!(store.ids.len(), 5);
+    }
+
+    #[test]
+    fn gc_orphans_refuses_above_ratio_at_scale() {
+        use crate::testkit::MockStore;
+        let content = chunk_ids(0..ORPHAN_GUARD_MIN_CONTENT * 2);
+        let manifest = manifest_with(&[("root", content[..50].to_vec())]);
+        let mut store = MockStore::new().with_ids(content.clone());
+        assert_eq!(
+            gc_orphans(&mut store, &manifest),
+            0,
+            "150 of 200 orphaned means the manifests are incomplete"
+        );
+        assert!(store.deleted.is_empty());
+        assert_eq!(store.ids.len(), content.len());
+    }
+
+    #[test]
+    fn gc_orphans_ratio_applies_from_the_floor_up() {
+        use crate::testkit::MockStore;
+        let content = chunk_ids(0..ORPHAN_GUARD_MIN_CONTENT);
+        let keep = ORPHAN_GUARD_MIN_CONTENT / 2 - 1;
+        let manifest = manifest_with(&[("root", content[..keep].to_vec())]);
+        let mut store = MockStore::new().with_ids(content.clone());
+        assert_eq!(
+            gc_orphans(&mut store, &manifest),
+            0,
+            "at exactly the floor the ratio guard is in force"
+        );
+        assert_eq!(store.ids.len(), content.len());
+    }
+
+    #[test]
+    fn gc_orphans_ignores_ratio_below_content_floor() {
+        use crate::testkit::MockStore;
+        let content = chunk_ids(0..4);
+        let manifest = manifest_with(&[("root", vec![content[0].clone()])]);
+        let mut store = MockStore::new().with_ids(content.clone());
+        assert_eq!(
+            gc_orphans(&mut store, &manifest),
+            3,
+            "a three-of-four delete on a tiny repo must still be reclaimable"
+        );
+        assert_eq!(store.ids, HashSet::from([content[0].clone()]));
+    }
+
+    #[test]
+    fn gc_orphans_ignores_union_ids_absent_from_content() {
+        use crate::testkit::MockStore;
+        let content = chunk_ids(0..3);
+        let mut referenced = content.clone();
+        referenced.push("chunk-departed".to_string());
+        let manifest = manifest_with(&[("root", referenced)]);
+        let mut store = MockStore::new().with_ids(content.clone());
+        assert_eq!(gc_orphans(&mut store, &manifest), 0);
+        assert!(
+            store.deleted.is_empty(),
+            "an id only the manifest knows is not a content chunk to delete"
+        );
+        assert_eq!(store.ids.len(), content.len());
+    }
+
+    #[test]
+    fn gc_orphans_deletes_exactly_content_minus_union() {
+        use crate::testkit::MockStore;
+        let content = chunk_ids(0..150);
+        let manifest = manifest_with(&[
+            ("root-a", content[..80].to_vec()),
+            ("root-b", content[60..120].to_vec()),
+        ]);
+        let mut store = MockStore::new().with_ids(content.clone());
+        let orphans: HashSet<String> = content[120..].iter().cloned().collect();
+        assert_eq!(gc_orphans(&mut store, &manifest), orphans.len());
+        assert_eq!(
+            store.deleted.iter().cloned().collect::<HashSet<String>>(),
+            orphans
+        );
+        assert_eq!(
+            store.ids,
+            content[..120].iter().cloned().collect::<HashSet<String>>()
+        );
     }
 }

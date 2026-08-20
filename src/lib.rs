@@ -6,6 +6,7 @@ pub mod daemon;
 pub mod embed;
 pub mod grammar;
 pub mod lazy;
+pub mod manifest;
 pub mod oneshot;
 pub mod registry;
 pub mod service;

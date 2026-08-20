@@ -1,4 +1,5 @@
 use clap::{Args, Parser, Subcommand};
+use index_repo::manifest::{HttpManifest, ManifestStore as _};
 use index_repo::registry::Registry;
 use index_repo::service;
 use index_repo::store::Store as _;
@@ -166,21 +167,34 @@ fn legacy_run(args: LegacyArgs) -> anyhow::Result<ExitCode> {
 
     let spec = index_repo::walk::load_ignore(&root);
 
+    let manifest_name = index_repo::config::manifest_collection_name(&collection_name);
+
     if args.full_rebuild {
         let _ = store.delete_collection(&collection_name);
+        let _ = store.delete_collection(&manifest_name);
     }
 
     store.get_or_create(&collection_name)?;
 
+    let mut manifest = HttpManifest::new(&args.host, args.port, args.ssl, &manifest_name);
+    manifest.get_or_create()?;
+
     let embedder = index_repo::embed::Embedder::from_env()?;
 
     if args.daemon {
-        let code =
-            index_repo::daemon::run_daemon(&mut store, &embedder, &root, &spec, args.debounce)?;
+        let code = index_repo::daemon::run_daemon(
+            &mut store,
+            &mut manifest,
+            &embedder,
+            &root,
+            &spec,
+            args.debounce,
+        )?;
         return Ok(ExitCode::from(code as u8));
     }
 
-    let stats = index_repo::oneshot::one_shot_index(&mut store, &embedder, &root, &spec)?;
+    let stats =
+        index_repo::oneshot::one_shot_index(&mut store, &mut manifest, &embedder, &root, &spec)?;
     let grammars = index_repo::grammar::used_grammars_str();
     let count = store.count()?;
 

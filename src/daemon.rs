@@ -2,21 +2,26 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::chunkfile::chunks_for_file;
 use crate::config::{EXTS, SPECIAL_NAMES};
 use crate::grammar::used_grammars_str;
+use crate::manifest::ManifestStore;
 use crate::oneshot::one_shot_index;
+use crate::registry::Registry;
 use crate::store::{Embed, Record, Store};
 use crate::walk::Ignore;
 use anyhow::Result;
 use notify_debouncer_full::new_debouncer;
 use notify_debouncer_full::notify::{EventKind, RecursiveMode};
 
+const RESYNC_INTERVAL: Duration = Duration::from_secs(45 * 60);
+
 pub enum Evt {
     Delete,
     Upsert,
+    Resync,
 }
 
 /// Map a notify `EventKind` to our `Evt`.
@@ -48,7 +53,10 @@ macro_rules! safe {
 ///
 /// On error, logs "daemon: failed to load existing metadata ({e})" and returns
 /// an empty map (daemon continues with empty state).
-pub fn build_path_to_ids(store: &dyn Store) -> HashMap<String, HashSet<String>> {
+pub fn build_path_to_ids(
+    store: &dyn Store,
+    my_ids: &HashSet<String>,
+) -> HashMap<String, HashSet<String>> {
     let mut mapping: HashMap<String, HashSet<String>> = HashMap::new();
     let pairs = match store.metadatas() {
         Ok(p) => p,
@@ -58,7 +66,7 @@ pub fn build_path_to_ids(store: &dyn Store) -> HashMap<String, HashSet<String>> 
         }
     };
     for (id, meta) in pairs {
-        if !meta.path.is_empty() {
+        if my_ids.contains(&id) && !meta.path.is_empty() {
             mapping.entry(meta.path).or_default().insert(id);
         }
     }
@@ -67,24 +75,31 @@ pub fn build_path_to_ids(store: &dyn Store) -> HashMap<String, HashSet<String>> 
 
 /// Apply one debounced batch of filesystem events as a per-file delta.
 ///
-/// Returns `(added, deleted)`.
-/// Every store call is wrapped in `safe!` — failures are logged and swallowed.
+/// Content is never deleted; removals only drop this root's manifest references,
+/// and the manifest is rewritten as a superset before any content add so a
+/// concurrent orphan sweep never deletes an added-but-unreferenced chunk. A
+/// delete event prunes the exact path and every path beneath it (directory
+/// removal); the batch applies every prune before every upsert, so a path
+/// restored in the same batch survives its parent's removal. Returns
+/// `(added, deleted_refs)`.
+#[allow(clippy::too_many_arguments)]
 pub fn process_changes(
     store: &mut dyn Store,
+    manifest: &mut dyn ManifestStore,
     embedder: &dyn Embed,
     root: &Path,
+    roothash: &str,
     changes: &[(Evt, PathBuf)],
     path_to_ids: &mut HashMap<String, HashSet<String>>,
     all_ids: &mut HashSet<String>,
 ) -> (usize, usize) {
-    // Collapse batch into a per-rel action map (Delete wins).
     let mut actions: HashMap<String, Evt> = HashMap::new();
     let mut paths: HashMap<String, PathBuf> = HashMap::new();
 
     for (evt, path) in changes {
         let rel = match path.strip_prefix(root) {
             Ok(r) => posix_str(r),
-            Err(_) => continue, // outside root
+            Err(_) => continue,
         };
         paths.insert(rel.clone(), path.clone());
         match evt {
@@ -92,100 +107,111 @@ pub fn process_changes(
                 actions.insert(rel, Evt::Delete);
             }
             Evt::Upsert => {
-                // Only set Upsert if we don't already have a Delete for this rel
                 if !matches!(actions.get(&rel), Some(Evt::Delete)) {
                     actions.insert(rel, Evt::Upsert);
                 }
             }
+            Evt::Resync => {}
         }
+    }
+
+    let mut target = all_ids.clone();
+    let mut removed_rels: Vec<String> = Vec::new();
+    let mut new_path_ids: HashMap<String, HashSet<String>> = HashMap::new();
+    let mut new_records: Vec<Record> = Vec::new();
+    let mut queued: HashSet<String> = HashSet::new();
+    let mut deleted: usize = 0;
+
+    // Split so the prune pass cannot land after an upsert for a path beneath a
+    // deleted directory; HashMap order must not decide that.
+    let mut del_rels: Vec<&str> = Vec::new();
+    let mut up_rels: Vec<&str> = Vec::new();
+    for (rel, action) in &actions {
+        if matches!(action, Evt::Delete) || !paths[rel].exists() {
+            del_rels.push(rel);
+        } else {
+            up_rels.push(rel);
+        }
+    }
+    del_rels.sort_unstable();
+    up_rels.sort_unstable();
+
+    for rel in del_rels {
+        let prefix = format!("{rel}/");
+        let matched: Vec<String> = path_to_ids
+            .keys()
+            .filter(|k| k.as_str() == rel || k.starts_with(&prefix))
+            .cloned()
+            .collect();
+        for k in matched {
+            if let Some(ids) = path_to_ids.get(&k) {
+                for id in ids {
+                    if target.remove(id) {
+                        deleted += 1;
+                    }
+                }
+            }
+            removed_rels.push(k);
+        }
+    }
+
+    for rel in up_rels {
+        let path = &paths[rel];
+        let (_rel2, records, _ts, _win, ok) = chunks_for_file(path, root);
+        if !ok {
+            continue;
+        }
+        let seen: HashSet<String> = records.iter().map(|r| r.id.clone()).collect();
+        if let Some(old) = path_to_ids.get(rel) {
+            for id in old.difference(&seen) {
+                if target.remove(id) {
+                    deleted += 1;
+                }
+            }
+        }
+        for r in records {
+            if target.insert(r.id.clone()) && all_ids.contains(&r.id) {
+                // the prune pass dropped this ref; the upsert brings it straight back
+                deleted = deleted.saturating_sub(1);
+            }
+            if !all_ids.contains(&r.id) && queued.insert(r.id.clone()) {
+                new_records.push(r);
+            }
+        }
+        new_path_ids.insert(rel.to_string(), seen);
+    }
+
+    if new_records.is_empty() && deleted == 0 && removed_rels.is_empty() {
+        return (0, 0);
+    }
+
+    let root_tag = root.to_string_lossy();
+    if safe!(manifest.write(roothash, &root_tag, &target)).is_none() {
+        return (0, 0);
     }
 
     let mut added: usize = 0;
-    let mut deleted: usize = 0;
-
-    for (rel, action) in &actions {
-        let path = &paths[rel];
-
-        let is_delete = matches!(action, Evt::Delete) || !path.exists();
-
-        if is_delete {
-            let old: HashSet<String> = path_to_ids.get(rel).cloned().unwrap_or_default();
-            if old.is_empty() {
-                path_to_ids.remove(rel);
-                continue;
-            }
-            let old_vec: Vec<String> = old.iter().cloned().collect();
-            if safe!(store.delete(&old_vec)).is_some() {
-                path_to_ids.remove(rel);
-                for id in &old {
-                    all_ids.remove(id);
+    if !new_records.is_empty() {
+        let docs: Vec<String> = new_records.iter().map(|r| r.body.clone()).collect();
+        match embedder.embed(&docs) {
+            Ok(embeddings) => {
+                if safe!(store.add(&new_records, &embeddings)).is_some() {
+                    added = new_records.len();
                 }
-                deleted += old.len();
             }
-            // On delete failure keep path_to_ids[rel] + all_ids so the next event
-            // retries — never silently forget chunks we failed to delete.
-            continue;
-        }
-
-        let (_rel2, records, _ts, _win, ok) = chunks_for_file(path, root);
-        if !ok {
-            continue; // binary file slipped through
-        }
-
-        let seen: HashSet<String> = records.iter().map(|r| r.id.clone()).collect();
-        // Whether every store op for this file landed. On any failure we leave the
-        // previous path_to_ids mapping in place so the next event recomputes the
-        // delta and retries (eventual consistency instead of silent drift).
-        let mut sync_ok = true;
-
-        // Stale ids: previously in this path but no longer present after rechunk
-        let stale: Vec<String> = path_to_ids
-            .get(rel)
-            .map(|old| old.difference(&seen).cloned().collect())
-            .unwrap_or_default();
-        if !stale.is_empty() {
-            if safe!(store.delete(&stale)).is_some() {
-                for id in &stale {
-                    all_ids.remove(id);
-                }
-                deleted += stale.len();
-            } else {
-                sync_ok = false;
-            }
-        }
-
-        let new_records: Vec<Record> = records
-            .into_iter()
-            .filter(|r| !all_ids.contains(&r.id))
-            .collect();
-        if !new_records.is_empty() {
-            let docs: Vec<String> = new_records.iter().map(|r| r.body.clone()).collect();
-            let added_ok = match embedder.embed(&docs) {
-                Ok(embeddings) => safe!(store.add(&new_records, &embeddings)).is_some(),
-                Err(e) => {
-                    eprintln!("daemon: embedding failed ({e})");
-                    false
-                }
-            };
-            if added_ok {
-                // Only mark ids present once the add landed, so a failed batch is
-                // retried on the next event instead of being lost.
-                for r in &new_records {
-                    all_ids.insert(r.id.clone());
-                }
-                added += new_records.len();
-            } else {
-                sync_ok = false;
-            }
-        }
-
-        if sync_ok {
-            path_to_ids.insert(rel.clone(), seen);
+            Err(e) => eprintln!("daemon: embedding failed ({e})"),
         }
     }
 
+    *all_ids = target;
+    for k in removed_rels {
+        path_to_ids.remove(&k);
+    }
+    for (rel, ids) in new_path_ids {
+        path_to_ids.insert(rel, ids);
+    }
+
     if added > 0 || deleted > 0 {
-        // Exact spec §10.4 message (em dash —)
         eprintln!(
             "daemon: live update \u{2014} added={added} deleted={deleted} chunks={}",
             all_ids.len()
@@ -231,48 +257,53 @@ pub fn watch_keep(root: &Path, spec: &Ignore, path: &Path) -> bool {
     EXTS.contains(&ext_lower.as_str()) || SPECIAL_NAMES.contains(&file_name)
 }
 
+/// Whether a filesystem event should be applied. Deletes bypass the
+/// extension/ignore filter so removals of ignored paths and whole directories
+/// still prune this root's manifest; upserts keep the file-selection filter.
+pub fn keep_event(root: &Path, spec: &Ignore, path: &Path, evt: &Evt) -> bool {
+    match evt {
+        Evt::Delete => path.starts_with(root),
+        Evt::Upsert => watch_keep(root, spec, path),
+        Evt::Resync => true,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // run_daemon  (Python daemon_main, lines 622-675)
 // ---------------------------------------------------------------------------
 
 pub fn run_daemon(
     store: &mut dyn Store,
+    manifest: &mut dyn ManifestStore,
     embedder: &dyn Embed,
     root: &Path,
     spec: &Ignore,
     debounce_ms: u64,
 ) -> Result<i32> {
-    // 1. Announce initial sync
     eprintln!("daemon: initial sync of {}", root.display());
 
-    // 2. Run one-shot incremental index
-    let stats = one_shot_index(store, embedder, root, spec)?;
+    let roothash = Registry::hash(root);
+    let stats = one_shot_index(store, manifest, embedder, root, spec)?;
 
-    // 3. Build path→ids from collection metadata
-    let mut path_to_ids = build_path_to_ids(store);
-    let mut all_ids: HashSet<String> = path_to_ids.values().flatten().cloned().collect();
+    let my_ids = manifest.read(&roothash).unwrap_or_default();
+    let mut path_to_ids = build_path_to_ids(store, &my_ids);
+    let mut all_ids: HashSet<String> = my_ids;
 
-    // 4. Record grammars used during initial sync
     let grammars = used_grammars_str();
-
-    // 5. Initial sync summary (exact spec §10.4)
     eprintln!(
         "daemon: initial sync done \u{2014} files={} added={} unchanged={} deleted={} chunks={} grammars={}",
         stats.files, stats.added, stats.unchanged, stats.deleted, all_ids.len(), grammars
     );
 
-    // 6. Signal handlers — set stop flag on SIGTERM / SIGINT / SIGHUP
     let stop = Arc::new(AtomicBool::new(false));
     for sig in [
         signal_hook::consts::SIGTERM,
         signal_hook::consts::SIGINT,
         signal_hook::consts::SIGHUP,
     ] {
-        // Ignore registration errors (e.g. some signals can't be caught)
         let _ = signal_hook::flag::register(sig, Arc::clone(&stop));
     }
 
-    // 7. Set up debouncer with mpsc channel
     let (tx, rx) = std::sync::mpsc::channel();
     let mut debouncer = match new_debouncer(Duration::from_millis(debounce_ms), None, tx) {
         Ok(d) => d,
@@ -287,13 +318,12 @@ pub fn run_daemon(
         return Ok(4);
     }
 
-    // 8. Announce watching
     eprintln!(
         "daemon: watching {} (debounce={debounce_ms}ms)",
         root.display()
     );
 
-    // 9. Watch loop
+    let mut last_resync = Instant::now();
     let exit_code = loop {
         if stop.load(Ordering::Relaxed) {
             break 0;
@@ -301,14 +331,13 @@ pub fn run_daemon(
 
         match rx.recv_timeout(Duration::from_millis(200)) {
             Ok(Ok(events)) => {
-                // Map debounced events → (Evt, PathBuf) list
                 let changes: Vec<(Evt, PathBuf)> = events
                     .iter()
                     .flat_map(|debounced_event| {
                         let kind = debounced_event.kind;
                         debounced_event.paths.iter().filter_map(move |path| {
-                            let evt = evt_for(&kind)?; // Access/Other/Any → ignore
-                            if watch_keep(root, spec, path) {
+                            let evt = evt_for(&kind)?;
+                            if keep_event(root, spec, path, &evt) {
                                 Some((evt, path.clone()))
                             } else {
                                 None
@@ -320,8 +349,10 @@ pub fn run_daemon(
                 if !changes.is_empty() {
                     process_changes(
                         store,
+                        manifest,
                         embedder,
                         root,
+                        &roothash,
                         &changes,
                         &mut path_to_ids,
                         &mut all_ids,
@@ -335,16 +366,19 @@ pub fn run_daemon(
                 return Ok(4);
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                // Normal — check stop flag and loop
+                if last_resync.elapsed() >= RESYNC_INTERVAL {
+                    if one_shot_index(store, manifest, embedder, root, spec).is_ok() {
+                        let my_ids = manifest.read(&roothash).unwrap_or_default();
+                        path_to_ids = build_path_to_ids(store, &my_ids);
+                        all_ids = my_ids;
+                    }
+                    last_resync = Instant::now();
+                }
             }
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                // Channel closed — exit
-                break 0;
-            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break 0,
         }
     };
 
-    // 10. Normal stop
     eprintln!("daemon: stopped");
     Ok(exit_code)
 }
@@ -373,8 +407,10 @@ mod tests {
     use super::*;
     use crate::chunkfile::chunks_for_file as cff;
     use crate::store::Meta;
-    use crate::testkit::{FakeEmbed, MockStore};
+    use crate::testkit::{FakeEmbed, MockManifest, MockStore};
     use std::fs;
+
+    const RH: &str = "rh";
 
     fn setup_file(dir: &Path, name: &str, content: &str) -> PathBuf {
         let p = dir.join(name);
@@ -387,7 +423,6 @@ mod tests {
     #[test]
     fn build_path_to_ids_groups_by_path() {
         let mut mock = MockStore::new();
-        // Seed two ids on "src/a.rs" and one on "src/b.rs"
         mock.metas = vec![
             (
                 "id1".to_string(),
@@ -421,43 +456,50 @@ mod tests {
             ),
         ];
 
-        let map = build_path_to_ids(&mock);
-        assert_eq!(map.len(), 2);
+        // Only this root's ids are grouped; whole-collection ids outside the set
+        // (id3) are skipped so a shared collection never leaks a sibling's paths.
+        let my_ids = HashSet::from(["id1".to_string(), "id2".to_string()]);
+        let map = build_path_to_ids(&mock, &my_ids);
+        assert_eq!(map.len(), 1);
         assert_eq!(
             map["src/a.rs"],
             HashSet::from(["id1".to_string(), "id2".to_string()])
         );
-        assert_eq!(map["src/b.rs"], HashSet::from(["id3".to_string()]));
+        assert!(
+            !map.contains_key("src/b.rs"),
+            "id3 is not in my_ids, so src/b.rs is not this root's"
+        );
     }
 
-    // ---- process_changes: delete ----
+    // ---- process_changes: delete never touches shared content ----
 
     #[test]
     fn delete_then_upsert_delta() {
         let d = tempfile::tempdir().unwrap();
         let py_path = setup_file(d.path(), "a.py", "def f():\n    return 1\n");
 
-        // Get the real ids the chunker produces
         let (_, initial_records, _, _, ok) = cff(&py_path, d.path());
         assert!(ok);
         assert!(!initial_records.is_empty());
 
         let initial_ids: HashSet<String> = initial_records.iter().map(|r| r.id.clone()).collect();
 
-        // Seed state: a.py has those ids
         let mut path_to_ids: HashMap<String, HashSet<String>> = HashMap::new();
         path_to_ids.insert("a.py".to_string(), initial_ids.clone());
         let mut all_ids = initial_ids.clone();
 
         let mut mock = MockStore::new().with_ids(initial_ids.clone());
+        let mut manifest = MockManifest::default();
+        manifest.sets.insert(RH.to_string(), initial_ids.clone());
 
         // --- Phase 1: delete a.py ---
         let changes = vec![(Evt::Delete, py_path.clone())];
-        let _spec = crate::walk::load_ignore(d.path());
         let (added, deleted) = process_changes(
             &mut mock,
+            &mut manifest,
             &FakeEmbed,
             d.path(),
+            RH,
             &changes,
             &mut path_to_ids,
             &mut all_ids,
@@ -467,43 +509,57 @@ mod tests {
         assert_eq!(
             deleted,
             initial_ids.len(),
-            "all original ids should be deleted"
+            "all original refs should be dropped"
         );
         assert!(
             !path_to_ids.contains_key("a.py"),
             "a.py removed from path_to_ids"
         );
         assert!(all_ids.is_empty(), "all_ids should be empty");
+
+        // A per-root prune only rewrites this root's manifest; shared content
+        // chunks are reclaimed later by the single-threaded orphan sweep.
+        assert!(
+            mock.deleted.is_empty(),
+            "content must never be deleted on a per-root prune"
+        );
+        let manifest_ids = manifest.read(RH).unwrap();
+        assert!(
+            manifest_ids.is_empty(),
+            "root manifest no longer references the pruned ids"
+        );
         for id in &initial_ids {
             assert!(
-                mock.deleted.contains(id),
-                "id {id} should be in mock.deleted"
+                mock.ids.contains(id),
+                "content chunk {id} survives in store"
             );
         }
 
         // --- Phase 2: upsert a.py with different content ---
         fs::write(&py_path, "def g():\n    return 2\n").unwrap();
         let changes2 = vec![(Evt::Upsert, py_path.clone())];
-        let (added2, deleted2) = process_changes(
+        let (added2, _deleted2) = process_changes(
             &mut mock,
+            &mut manifest,
             &FakeEmbed,
             d.path(),
+            RH,
             &changes2,
             &mut path_to_ids,
             &mut all_ids,
         );
 
         assert!(added2 >= 1, "upsert should add at least 1 chunk");
-        // (deleted2 may be 0 if path_to_ids was empty going in)
-        let _ = deleted2;
         assert!(
             path_to_ids.contains_key("a.py"),
             "a.py re-added to path_to_ids"
         );
-        // all_ids should match the new seen set
         let new_seen = path_to_ids["a.py"].clone();
+        let manifest_ids2 = manifest.read(RH).unwrap();
         for id in &new_seen {
             assert!(all_ids.contains(id), "id {id} should be in all_ids");
+            assert!(manifest_ids2.contains(id), "id {id} recorded in manifest");
+            assert!(mock.ids.contains(id), "id {id} added to content store");
         }
     }
 
@@ -514,29 +570,30 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let py_path = setup_file(d.path(), "a.py", "def f():\n    return 1\n");
 
-        // Give the file existing state
         let (_, records, _, _, _) = cff(&py_path, d.path());
         let ids: HashSet<String> = records.iter().map(|r| r.id.clone()).collect();
         let mut path_to_ids: HashMap<String, HashSet<String>> = HashMap::new();
         path_to_ids.insert("a.py".to_string(), ids.clone());
         let mut all_ids = ids.clone();
         let mut mock = MockStore::new().with_ids(ids.clone());
+        let mut manifest = MockManifest::default();
+        manifest.sets.insert(RH.to_string(), ids.clone());
 
-        // Send both Upsert and Delete in the same batch
         let changes = vec![
             (Evt::Upsert, py_path.clone()),
             (Evt::Delete, py_path.clone()),
         ];
         let (added, _deleted) = process_changes(
             &mut mock,
+            &mut manifest,
             &FakeEmbed,
             d.path(),
+            RH,
             &changes,
             &mut path_to_ids,
             &mut all_ids,
         );
 
-        // Net effect must be delete (delete wins)
         assert_eq!(added, 0, "delete wins — nothing should be added");
         assert!(
             !path_to_ids.contains_key("a.py"),
@@ -546,6 +603,233 @@ mod tests {
             all_ids.is_empty(),
             "all_ids should be empty after delete wins"
         );
+        assert!(
+            manifest.read(RH).unwrap().is_empty(),
+            "manifest emptied after delete wins"
+        );
+        assert!(mock.deleted.is_empty(), "content never deleted on prune");
+    }
+
+    // ---- Delete of a directory prunes the whole subtree ----
+
+    #[test]
+    fn delete_event_prunes_directory_subtree() {
+        let d = tempfile::tempdir().unwrap();
+        let id_a = "ida".to_string();
+        let id_b = "idb".to_string();
+
+        let mut path_to_ids: HashMap<String, HashSet<String>> = HashMap::new();
+        path_to_ids.insert("sub/a.rs".to_string(), HashSet::from([id_a.clone()]));
+        path_to_ids.insert("sub/b.rs".to_string(), HashSet::from([id_b.clone()]));
+        let mut all_ids = HashSet::from([id_a.clone(), id_b.clone()]);
+
+        let mut mock = MockStore::new().with_ids(all_ids.clone());
+        let mut manifest = MockManifest::default();
+        manifest.sets.insert(RH.to_string(), all_ids.clone());
+
+        let changes = vec![(Evt::Delete, d.path().join("sub"))];
+        let (added, deleted) = process_changes(
+            &mut mock,
+            &mut manifest,
+            &FakeEmbed,
+            d.path(),
+            RH,
+            &changes,
+            &mut path_to_ids,
+            &mut all_ids,
+        );
+
+        assert_eq!(added, 0, "directory delete adds nothing");
+        assert_eq!(deleted, 2, "both ids beneath sub/ are pruned");
+        assert!(!all_ids.contains(&id_a));
+        assert!(!all_ids.contains(&id_b));
+        assert!(!path_to_ids.contains_key("sub/a.rs"));
+        assert!(!path_to_ids.contains_key("sub/b.rs"));
+        assert!(
+            manifest.read(RH).unwrap().is_empty(),
+            "manifest empty after subtree prune"
+        );
+        assert!(mock.deleted.is_empty(), "content never deleted on prune");
+    }
+
+    // ---- A directory Delete and an Upsert beneath it in one batch ----
+
+    /// Index `n` sibling subtrees, each holding one live python file.
+    /// Returns `(rel, path, chunk ids)` per file.
+    fn seed_subtrees(d: &Path, n: usize) -> Vec<(String, PathBuf, HashSet<String>)> {
+        (0..n)
+            .map(|i| {
+                let dir = d.join(format!("sub{i}"));
+                fs::create_dir_all(&dir).unwrap();
+                let f = setup_file(&dir, "a.py", &format!("def f{i}():\n    return {i}\n"));
+                let (rel, records, _, _, ok) = cff(&f, d);
+                assert!(ok && !records.is_empty(), "fixture {rel} must yield chunks");
+                let ids: HashSet<String> = records.iter().map(|r| r.id.clone()).collect();
+                (rel, f, ids)
+            })
+            .collect()
+    }
+
+    fn tracked(
+        seeded: &[(String, PathBuf, HashSet<String>)],
+    ) -> (HashMap<String, HashSet<String>>, HashSet<String>) {
+        let path_to_ids: HashMap<String, HashSet<String>> = seeded
+            .iter()
+            .map(|(rel, _, ids)| (rel.clone(), ids.clone()))
+            .collect();
+        let all_ids: HashSet<String> = path_to_ids.values().flatten().cloned().collect();
+        (path_to_ids, all_ids)
+    }
+
+    #[test]
+    fn dir_delete_with_upsert_beneath_it_keeps_the_file_indexed() {
+        let d = tempfile::tempdir().unwrap();
+        // Eight pairs: under the old HashMap-order loop every directory would
+        // have to precede its own file by chance for this to pass.
+        let seeded = seed_subtrees(d.path(), 8);
+        let (mut path_to_ids, mut all_ids) = tracked(&seeded);
+        let before = all_ids.clone();
+
+        let mut mock = MockStore::new().with_ids(all_ids.clone());
+        let mut manifest = MockManifest::default();
+        manifest.sets.insert(RH.to_string(), all_ids.clone());
+
+        // `rm -rf subN && git checkout subN` inside one debounce window.
+        let mut changes: Vec<(Evt, PathBuf)> = Vec::new();
+        for (_, f, _) in &seeded {
+            changes.push((Evt::Delete, f.parent().unwrap().to_path_buf()));
+            changes.push((Evt::Upsert, f.clone()));
+        }
+
+        let (added, deleted) = process_changes(
+            &mut mock,
+            &mut manifest,
+            &FakeEmbed,
+            d.path(),
+            RH,
+            &changes,
+            &mut path_to_ids,
+            &mut all_ids,
+        );
+
+        assert_eq!(added, 0, "the restored content is already in the store");
+        assert_eq!(
+            deleted, 0,
+            "every pruned ref is restored by the upsert in the same batch"
+        );
+        assert_eq!(all_ids, before, "no live id may leave this root's set");
+
+        let manifest_ids = manifest.read(RH).unwrap();
+        for (rel, _, ids) in &seeded {
+            let live = path_to_ids
+                .get(rel)
+                .unwrap_or_else(|| panic!("{rel} must still be tracked"));
+            assert_eq!(live, ids, "{rel} keeps its chunk ids");
+            for id in ids {
+                assert!(
+                    manifest_ids.contains(id),
+                    "path_to_ids claims id {id} of {rel}, so the manifest must \
+                     reference it or the orphan sweep will delete the chunk"
+                );
+                assert!(mock.ids.contains(id), "id {id} of {rel} survives in store");
+            }
+        }
+        assert!(mock.deleted.is_empty(), "content never deleted on prune");
+    }
+
+    #[test]
+    fn dir_delete_alone_prunes_the_subtree() {
+        let d = tempfile::tempdir().unwrap();
+        let seeded = seed_subtrees(d.path(), 2);
+        let (mut path_to_ids, mut all_ids) = tracked(&seeded);
+        let before = all_ids.clone();
+
+        let mut mock = MockStore::new().with_ids(all_ids.clone());
+        let mut manifest = MockManifest::default();
+        manifest.sets.insert(RH.to_string(), all_ids.clone());
+
+        // The same fixture minus the upserts: nothing re-asserts the files, so
+        // the subtree prune stands even though they are still on disk.
+        let changes: Vec<(Evt, PathBuf)> = seeded
+            .iter()
+            .map(|(_, f, _)| (Evt::Delete, f.parent().unwrap().to_path_buf()))
+            .collect();
+
+        let (added, deleted) = process_changes(
+            &mut mock,
+            &mut manifest,
+            &FakeEmbed,
+            d.path(),
+            RH,
+            &changes,
+            &mut path_to_ids,
+            &mut all_ids,
+        );
+
+        assert_eq!(added, 0, "a prune adds nothing");
+        assert_eq!(deleted, before.len(), "every ref beneath subN is dropped");
+        assert!(all_ids.is_empty(), "the root references nothing");
+        for (rel, _, _) in &seeded {
+            assert!(!path_to_ids.contains_key(rel), "{rel} is untracked");
+        }
+        assert!(
+            manifest.read(RH).unwrap().is_empty(),
+            "manifest empty after subtree prune"
+        );
+        assert!(mock.deleted.is_empty(), "content never deleted on prune");
+        for id in &before {
+            assert!(mock.ids.contains(id), "chunk {id} survives for the sweep");
+        }
+    }
+
+    // ---- Upsert after a rechunk drops the stale ids from this root ----
+
+    #[test]
+    fn upsert_rechunk_drops_stale_ids() {
+        let d = tempfile::tempdir().unwrap();
+        let py_path = setup_file(d.path(), "a.py", "def f():\n    return 1\n");
+
+        let (_, records, _, _, _) = cff(&py_path, d.path());
+        let old_ids: HashSet<String> = records.iter().map(|r| r.id.clone()).collect();
+        let mut path_to_ids: HashMap<String, HashSet<String>> = HashMap::new();
+        path_to_ids.insert("a.py".to_string(), old_ids.clone());
+        let mut all_ids = old_ids.clone();
+
+        let mut mock = MockStore::new().with_ids(old_ids.clone());
+        let mut manifest = MockManifest::default();
+        manifest.sets.insert(RH.to_string(), old_ids.clone());
+
+        // Rewrite the file so the chunker yields different ids.
+        fs::write(&py_path, "def g():\n    return 2\n").unwrap();
+        let changes = vec![(Evt::Upsert, py_path.clone())];
+        let (added, deleted) = process_changes(
+            &mut mock,
+            &mut manifest,
+            &FakeEmbed,
+            d.path(),
+            RH,
+            &changes,
+            &mut path_to_ids,
+            &mut all_ids,
+        );
+
+        assert!(added >= 1, "the rechunked content is added");
+        assert!(deleted >= 1, "the stale ids are dropped from this root");
+
+        let new_ids = path_to_ids["a.py"].clone();
+        let manifest_ids = manifest.read(RH).unwrap();
+        for id in old_ids.difference(&new_ids) {
+            assert!(!all_ids.contains(id), "stale id {id} gone from all_ids");
+            assert!(
+                !manifest_ids.contains(id),
+                "stale id {id} gone from manifest"
+            );
+        }
+        for id in &new_ids {
+            assert!(all_ids.contains(id), "new id {id} present in all_ids");
+            assert!(manifest_ids.contains(id), "new id {id} present in manifest");
+            assert!(mock.ids.contains(id), "new id {id} added to content store");
+        }
     }
 
     // ---- evt_for ----
@@ -578,65 +862,79 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let spec = crate::walk::load_ignore(d.path());
 
-        // Indexable extension → keep
         assert!(watch_keep(d.path(), &spec, &d.path().join("foo.rs")));
-        // Non-indexable extension → drop
         assert!(!watch_keep(d.path(), &spec, &d.path().join("image.png")));
-        // Special name → keep
         assert!(watch_keep(d.path(), &spec, &d.path().join("Makefile")));
-        // Outside root → drop
         assert!(!watch_keep(d.path(), &spec, Path::new("/tmp/outside.rs")));
-        // No size check: a path that doesn't exist is still kept (delete events)
         assert!(watch_keep(d.path(), &spec, &d.path().join("ghost.rs")));
     }
-    // ---- process_changes: add-failure retry (no silent drift) ----
+
+    // ---- keep_event: deletes bypass the file-selection filter ----
 
     #[test]
-    fn failed_add_is_retried_on_next_event() {
+    fn keep_event_lets_deletes_bypass_filter() {
+        let d = tempfile::tempdir().unwrap();
+        let spec = crate::walk::load_ignore(d.path());
+
+        // An extensionless directory path is rejected by the upsert filter.
+        let dir = d.path().join("sub");
+        assert!(
+            !watch_keep(d.path(), &spec, &dir),
+            "precondition: upsert filter rejects the directory path"
+        );
+        assert!(
+            keep_event(d.path(), &spec, &dir, &Evt::Delete),
+            "deletes bypass the filter so directory removals still prune"
+        );
+        assert!(
+            !keep_event(d.path(), &spec, &dir, &Evt::Upsert),
+            "upserts keep the file-selection filter"
+        );
+        assert!(
+            keep_event(d.path(), &spec, &dir, &Evt::Resync),
+            "resync always passes"
+        );
+    }
+
+    // ---- process_changes: a failed add lands no content ----
+
+    #[test]
+    fn failed_add_records_membership_but_lands_no_content() {
         let d = tempfile::tempdir().unwrap();
         let py_path = setup_file(d.path(), "a.py", "def f():\n    return 1\n");
 
         let mut path_to_ids: HashMap<String, HashSet<String>> = HashMap::new();
         let mut all_ids: HashSet<String> = HashSet::new();
 
-        // Phase 1: store.add fails — nothing must be marked present.
+        // The manifest is written as an optimistic superset before the content
+        // add, so a concurrent orphan sweep never reclaims a chunk mid-insert;
+        // a failed add lands no content and is reconciled by resync, not retry.
         let mut mock = MockStore::new().with_failing_add();
+        let mut manifest = MockManifest::default();
         let changes = vec![(Evt::Upsert, py_path.clone())];
-        let (added1, _) = process_changes(
+        let (added, _deleted) = process_changes(
             &mut mock,
+            &mut manifest,
             &FakeEmbed,
             d.path(),
+            RH,
             &changes,
             &mut path_to_ids,
             &mut all_ids,
         );
-        assert_eq!(added1, 0, "failed add must not count as added");
-        assert!(
-            all_ids.is_empty(),
-            "no ids marked present after a failed add"
-        );
-        assert!(
-            !path_to_ids.contains_key("a.py"),
-            "path mapping must not be committed on failure"
-        );
-        assert!(mock.ids.is_empty(), "nothing landed in the store");
 
-        // Phase 2: same file, store healthy — the add must be retried, not lost.
-        mock.fail_add = false;
-        let (added2, _) = process_changes(
-            &mut mock,
-            &FakeEmbed,
-            d.path(),
-            &changes,
-            &mut path_to_ids,
-            &mut all_ids,
+        assert_eq!(
+            added, 0,
+            "a failed add contributes nothing to the add count"
         );
-        assert!(added2 >= 1, "healthy retry must add the chunks");
-        assert!(!all_ids.is_empty(), "ids present after successful retry");
-        assert!(
-            path_to_ids.contains_key("a.py"),
-            "mapping committed on success"
-        );
-        assert!(!mock.ids.is_empty(), "chunks landed in the store on retry");
+        assert!(mock.ids.is_empty(), "no content lands when the add fails");
+
+        let seen = path_to_ids.get("a.py").cloned().unwrap_or_default();
+        assert!(!seen.is_empty(), "membership was recorded before the add");
+        let manifest_ids = manifest.read(RH).unwrap();
+        for id in &seen {
+            assert!(manifest_ids.contains(id), "id {id} pre-written to manifest");
+            assert!(all_ids.contains(id), "id {id} recorded in all_ids");
+        }
     }
 }

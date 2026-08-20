@@ -70,6 +70,41 @@ The `serve` daemon garbage-collects collections whose repo hasn't been indexed
 (opened or edited) in `INDEX_REPO_TTL_DAYS` days (default 30); set `0` to
 disable, or `INDEX_REPO_GC_DRY_RUN=1` to preview.
 
+### Shared content collection & per-root manifests
+
+The content collection is keyed by git origin (`code-<owner>-<repo>`), so every
+checkout of the same repository — worktrees, clones, CI checkouts — maps to one
+collection. To let those checkouts coexist without deleting each other's chunks,
+membership is tracked **out of band** in a sidecar collection named
+`<content>__manifests`, created automatically. Each root writes only its own
+id-set there; the chunk id and metadata in the content collection stay identical
+to the parity contract.
+
+- **Safe sharing:** identical file content across checkouts collapses to one
+  shared content chunk referenced by several manifests; divergent content keeps
+  distinct chunks. A per-root prune never deletes content directly — it only
+  rewrites that root's manifest.
+- **Orphan GC:** chunks referenced by no manifest are reclaimed by a periodic
+  single-threaded sweep (`content_ids − union(manifests)`), every 5 minutes. The
+  sweep does nothing while no manifests exist yet, so a fresh collection is never
+  wiped, and on a collection of at least ~100 chunks it also refuses to delete
+  more than half of it at once (a sign the manifests were read incompletely —
+  `--full-rebuild` is the fix). Dropping a collection also drops its
+  `__manifests` sidecar.
+- **Periodic resync:** each root re-runs a full scan every 45 minutes and whenever
+  its `.gitignore` changes, converging membership after out-of-band edits — and
+  restoring anything a failed ChromaDB write left missing.
+- **Upgrade:** run `index-repo --full-rebuild <repo>` once when upgrading to this
+  version. It drops **both** the content collection and its `__manifests`
+  sidecar before reindexing, so old and new membership schemes never mix.
+  **Stop `serve` first** — `systemctl --user stop index-repo` — and start it again
+  afterwards. A running actor resolves each collection's UUID once and caches it
+  for its lifetime, so if another checkout of the same origin is being watched
+  while the collections are dropped, that actor keeps posting to a UUID that no
+  longer exists: every manifest write 404s, every change batch bails out early,
+  and not even the periodic resync recovers. That root stays unindexed until
+  `serve` is restarted.
+
 ### Languages
 
 Tree-sitter AST chunking covers **Python, JavaScript, TypeScript, TSX, Rust, Go,

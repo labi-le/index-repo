@@ -1,13 +1,23 @@
 use crate::chunkfile::chunks_for_file;
 use crate::config::BATCH;
+use crate::manifest::ManifestStore;
+use crate::registry::Registry;
 use crate::store::{Embed, Record, Stats, Store};
 use crate::walk::{iter_files, Ignore};
 use anyhow::Result;
 use std::collections::HashSet;
 use std::path::Path;
 
+/// Index `root` into the shared content collection and record this root's
+/// referenced id-set in its manifest.
+///
+/// Content is never deleted here: identical chunks may be shared with other
+/// checkouts, so removal is deferred to the single-threaded orphan sweep
+/// (`service::gc_orphans`). The manifest is written before content is added so
+/// a concurrent sweep never sees an added-but-unreferenced chunk.
 pub fn one_shot_index(
     store: &mut dyn Store,
+    manifest: &mut dyn ManifestStore,
     embedder: &dyn Embed,
     root: &Path,
     spec: &Ignore,
@@ -21,17 +31,15 @@ pub fn one_shot_index(
     };
 
     let mut seen: HashSet<String> = HashSet::new();
-    let mut buffer: Vec<Record> = Vec::new();
-
+    let mut records: Vec<Record> = Vec::new();
     let mut files: usize = 0;
-    let mut added: usize = 0;
     let mut unchanged: usize = 0;
     let mut ts_chunks: usize = 0;
     let mut win_chunks: usize = 0;
     let mut skipped_bin: usize = 0;
 
     for path in iter_files(root, spec) {
-        let (_rel, records, ts, win, ok) = chunks_for_file(&path, root);
+        let (_rel, recs, ts, win, ok) = chunks_for_file(&path, root);
         if !ok {
             skipped_bin += 1;
             continue;
@@ -40,32 +48,35 @@ pub fn one_shot_index(
         ts_chunks += ts;
         win_chunks += win;
 
-        for record in records {
-            seen.insert(record.id.clone());
+        for record in recs {
+            if !seen.insert(record.id.clone()) {
+                continue;
+            }
             if existing.contains(&record.id) {
                 unchanged += 1;
             } else {
-                buffer.push(record);
-                if buffer.len() >= BATCH {
-                    added += flush(&mut buffer, store, embedder)?;
-                }
+                records.push(record);
             }
         }
     }
 
-    added += flush(&mut buffer, store, embedder)?;
+    manifest.write(&Registry::hash(root), &root.to_string_lossy(), &seen)?;
 
-    let stale: Vec<String> = existing.difference(&seen).cloned().collect();
-    let mut deleted: usize = 0;
-    for chunk in stale.chunks(BATCH) {
-        deleted += store.delete(chunk)?;
+    let mut added: usize = 0;
+    let mut buffer: Vec<Record> = Vec::new();
+    for record in records {
+        buffer.push(record);
+        if buffer.len() >= BATCH {
+            added += flush(&mut buffer, store, embedder)?;
+        }
     }
+    added += flush(&mut buffer, store, embedder)?;
 
     Ok(Stats {
         files,
         added,
         unchanged,
-        deleted,
+        deleted: 0,
         ts_chunks,
         win_chunks,
         skipped_bin,
@@ -87,11 +98,11 @@ fn flush(buffer: &mut Vec<Record>, store: &mut dyn Store, embedder: &dyn Embed) 
 mod tests {
     use super::*;
     use crate::chunkfile::chunks_for_file as cff;
-    use crate::testkit::{FakeEmbed, MockStore};
+    use crate::testkit::{FakeEmbed, MockManifest, MockStore};
     use std::fs;
 
     #[test]
-    fn adds_new_keeps_unchanged_deletes_stale() {
+    fn adds_new_keeps_unchanged_writes_manifest() {
         let d = tempfile::tempdir().unwrap();
         let py_path = d.path().join("a.py");
         fs::write(&py_path, "def f():\n    return 1\n").unwrap();
@@ -106,20 +117,30 @@ mod tests {
         let unchanged_id = real_records[0].id.clone();
 
         let mut mock = MockStore::new().with_ids([unchanged_id.clone(), "STALE".to_string()]);
+        let mut manifest = MockManifest::default();
 
         let spec = crate::walk::load_ignore(d.path());
-        let stats = one_shot_index(&mut mock, &FakeEmbed, d.path(), &spec).unwrap();
+        let stats = one_shot_index(&mut mock, &mut manifest, &FakeEmbed, d.path(), &spec).unwrap();
 
         assert_eq!(stats.files, 1, "files");
-
         assert!(stats.unchanged >= 1, "unchanged >= 1");
+        assert_eq!(stats.deleted, 0, "content is never deleted in one_shot");
 
         assert!(
-            mock.deleted.contains(&"STALE".to_string()),
-            "STALE should be deleted; deleted={:?}",
+            !mock.deleted.contains(&"STALE".to_string()),
+            "orphans are reclaimed by the sweep, not one_shot; deleted={:?}",
             mock.deleted
         );
-        assert!(stats.deleted >= 1, "deleted >= 1");
+
+        let recorded = manifest.read(&Registry::hash(d.path())).unwrap();
+        assert!(
+            recorded.contains(&unchanged_id),
+            "manifest must record the root's referenced ids"
+        );
+        assert!(
+            !recorded.contains("STALE"),
+            "manifest holds only this root's current ids"
+        );
     }
 
     #[test]
@@ -127,8 +148,9 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         fs::write(d.path().join("bin.py"), b"\x00\x01\x02 binary content").unwrap();
         let mut mock = MockStore::new();
+        let mut manifest = MockManifest::default();
         let spec = crate::walk::load_ignore(d.path());
-        let stats = one_shot_index(&mut mock, &FakeEmbed, d.path(), &spec).unwrap();
+        let stats = one_shot_index(&mut mock, &mut manifest, &FakeEmbed, d.path(), &spec).unwrap();
         assert_eq!(stats.skipped_bin, 1);
         assert_eq!(stats.files, 0);
     }
@@ -137,8 +159,9 @@ mod tests {
     fn empty_dir_returns_zero_stats() {
         let d = tempfile::tempdir().unwrap();
         let mut mock = MockStore::new();
+        let mut manifest = MockManifest::default();
         let spec = crate::walk::load_ignore(d.path());
-        let stats = one_shot_index(&mut mock, &FakeEmbed, d.path(), &spec).unwrap();
+        let stats = one_shot_index(&mut mock, &mut manifest, &FakeEmbed, d.path(), &spec).unwrap();
         assert_eq!(stats.files, 0);
         assert_eq!(stats.added, 0);
         assert_eq!(stats.deleted, 0);
@@ -183,8 +206,9 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         fs::write(d.path().join("a.rs"), "fn x() {}").unwrap();
         let mut store = FailingStore(MockStore::new());
+        let mut manifest = MockManifest::default();
         let spec = crate::walk::load_ignore(d.path());
-        let stats = one_shot_index(&mut store, &FakeEmbed, d.path(), &spec).unwrap();
+        let stats = one_shot_index(&mut store, &mut manifest, &FakeEmbed, d.path(), &spec).unwrap();
         assert!(
             stats.added >= 1,
             "should add chunks when existing treated as empty"

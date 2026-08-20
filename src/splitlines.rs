@@ -21,7 +21,8 @@ pub fn py_splitlines(s: &str) -> Vec<&str> {
             || bytes[i] == 0x0C // FF
             || bytes[i] == 0x1C // FS
             || bytes[i] == 0x1D // GS
-            || bytes[i] == 0x1E // RS
+            || bytes[i] == 0x1E
+        // RS
         {
             Some(1)
         } else if bytes[i] == 0xC2 && i + 1 < len && bytes[i + 1] == 0x85 {
