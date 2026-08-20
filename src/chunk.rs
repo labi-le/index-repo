@@ -41,10 +41,9 @@ fn walk_semantic<'a>(node: Node<'a>, targets: &[&str], out: &mut Vec<Node<'a>>) 
         out.push(node);
         return; // do not descend
     }
-    for i in 0..node.child_count() {
-        if let Some(child) = node.child(i) {
-            walk_semantic(child, targets, out);
-        }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        walk_semantic(child, targets, out);
     }
 }
 

@@ -4,9 +4,16 @@ use sha1::{Digest, Sha1};
 use std::path::Path;
 
 pub fn chunk_id(rel: &str, line: usize, body: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut hasher = Sha1::new();
     hasher.update(format!("{rel}:{line}:{body}").as_bytes());
-    format!("{:x}", hasher.finalize())
+    let digest = hasher.finalize();
+    let mut out = String::with_capacity(digest.len() * 2);
+    for b in digest {
+        out.push(HEX[(b >> 4) as usize] as char);
+        out.push(HEX[(b & 0x0f) as usize] as char);
+    }
+    out
 }
 
 pub fn lang_field(path: &Path) -> String {
