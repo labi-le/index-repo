@@ -96,7 +96,18 @@ git add flake.lock && git commit -m 'flake: bump index-repo' && git push
 
 ## Misc gotchas
 
-- No CI gate runs fmt/clippy/tests on push (only release/flake-update
-  workflows) — **you** own verification.
+- CI (`.github/workflows/ci.yaml`) runs `cargo fmt --check`, `cargo clippy
+  --lib --bins -D warnings` and `cargo test --lib` inside the devShell on every
+  PR and every push to `main`. The `CHROMA_TEST=1` suites are NOT in CI (they
+  need the LAN ChromaDB) — you still own those locally.
+- Dependabot version updates (`.github/dependabot.yml`, cargo +
+  github-actions) are auto-merged **only** when that `ci` run is green
+  (`automerge-dependabot.yml` triggers on `workflow_run`). A breaking bump
+  therefore parks as an open red PR instead of landing on `main`.
+- Code scanning: CodeQL default queries plus `security-and-quality`
+  (`codeql.yaml`, languages `rust` + `actions`). Two standing dismissals:
+  `actions/unpinned-tag` (won't fix — actions stay on floating tags) and
+  `rust/unused-variable` for bindings used only inside a `json!` macro body
+  (false positive; the extractor misses uses inside macro expansions).
 - `rust-toolchain.toml` says `stable`, but the devShell uses nixpkgs rustfmt;
   formatting can drift between the two. Always fmt inside the devShell.
