@@ -81,6 +81,12 @@ in
         };
       };
     };
+    omp = {
+      registerHook.enable = lib.mkEnableOption ''
+        an oh-my-pi extension that registers the session's cwd with this indexer
+        daemon. It fires on session_start and agent_start; opt out per-repo with a
+        `.no-code-index` file or globally with `CODE_INDEXER_DISABLE=1'';
+    };
   };
 
   config = lib.mkMerge [
@@ -107,6 +113,15 @@ in
         timeout = 30000;
         enabled = true;
       };
+    })
+
+    (lib.mkIf cfg.omp.registerHook.enable {
+      home.file.".omp/agent/extensions/repo-register.js".source =
+        pkgs.substituteAll {
+          name = "repo-register.js";
+          src = ../hooks/omp/repo-register.js;
+          index_repo_bin = "${cfg.package}/bin/index-repo";
+        };
     })
   ];
 }

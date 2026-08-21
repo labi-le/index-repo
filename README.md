@@ -190,3 +190,21 @@ The plugin resolves the collection the same way the indexer does — from the gi
 `origin` remote (`code-<owner>-<repo>`), falling back to `code-<basename>-<hash8>`
 — so no configuration is needed: start an agent in the indexed repo and it will
 be told to query that collection first.
+
+## oh-my-pi integration
+
+The repo ships an oh-my-pi (omp) extension at
+[`hooks/omp/repo-register.js`](hooks/omp/repo-register.js) that registers the
+session's cwd with this indexer's daemon, so the chroma MCP has it indexed. It
+fires on `session_start` and `agent_start`, starts `index-repo.service` on
+demand, and ties each registration to the omp process (`--pid`) with an `exit`
+handler that unregisters it. Opt out per-repo with a `.no-code-index` file, or
+globally with `CODE_INDEXER_DISABLE=1`.
+
+```nix
+services.index-repo.omp.registerHook.enable = true;
+```
+
+The module deploys the extension to `~/.omp/agent/extensions/repo-register.js`
+(the native omp extension scan root, same place as the shipped commit-gate /
+comment-gate extensions).
