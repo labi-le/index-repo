@@ -117,9 +117,7 @@ in
 
     (lib.mkIf cfg.omp.registerHook.enable {
       home.file.".omp/agent/extensions/repo-register.js".source =
-        pkgs.substituteAll {
-          name = "repo-register.js";
-          src = ../hooks/omp/repo-register.js;
+        pkgs.replaceVars ../hooks/omp/repo-register.js {
           index_repo_bin = "${cfg.package}/bin/index-repo";
         };
     })
