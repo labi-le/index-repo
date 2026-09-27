@@ -178,8 +178,10 @@ home-manager `programs.opencode` module to be present.
      "mcp": {
        "chroma": {
          "type": "local",
-         "command": ["uvx", "chroma-mcp", "--client-type", "http",
-                     "--host", "127.0.0.1", "--port", "8000", "--ssl", "false"],
+         "command": ["uvx", "--from", "chroma-mcp", "python", "-c",
+                     "import functools, sys; import chroma_mcp.server as server; server.print = functools.partial(print, file=sys.stderr); server.main()",
+                     "--client-type", "http", "--host", "127.0.0.1",
+                     "--port", "8000", "--ssl", "false"],
          "enabled": true
        }
      }
