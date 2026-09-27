@@ -25,12 +25,14 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
           HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
         run: |
           set -euo pipefail
 
-          number=$(gh pr list --head "$HEAD_BRANCH" --state open \
-            --json number,author \
-            --jq 'map(select(.author.login == "dependabot[bot]")) | .[0].number // empty')
+          number=$(gh pr list --app dependabot --head "$HEAD_BRANCH" --state open \
+            --json number,author,headRefOid,headRepository |
+            jq -r --arg sha "$HEAD_SHA" --arg repo "$GH_REPO" \
+              'map(select(.author.login == "app/dependabot" and .author.is_bot == true and .headRefOid == $sha and .headRepository.nameWithOwner == $repo)) | .[0].number // empty')
 
           if [ -z "$number" ]; then
             echo "no open dependabot pr for $HEAD_BRANCH, nothing to merge"
@@ -38,7 +40,7 @@ jobs:
           fi
 
           for attempt in 1 2 3 4 5; do
-            if gh pr merge --merge "$number"; then exit 0; fi
+            if gh pr merge --merge --match-head-commit "$HEAD_SHA" "$number"; then exit 0; fi
             sleep $((attempt * 5))
           done
           exit 1
