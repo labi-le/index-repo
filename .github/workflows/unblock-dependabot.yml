@@ -1,0 +1,77 @@
+---
+name: "Dependabot Unblock - Action"
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened]
+  schedule:
+    - cron: "7,22,37,52 * * * *"
+  workflow_dispatch:
+
+permissions:
+  actions: write
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: dependabot-unblock
+  cancel-in-progress: false
+
+jobs:
+  unblock:
+    name: DependabotUnblock
+    runs-on: ubuntu-latest
+    if: >-
+      github.event_name != 'pull_request_target'
+      || github.event.pull_request.user.login == 'dependabot[bot]'
+    steps:
+      - name: Approve held runs, merge on green
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          EVENT_PR: ${{ github.event.pull_request.number }}
+        run: |
+          set -uo pipefail
+
+          prs="${EVENT_PR:-}"
+          if [ -z "$prs" ]; then
+            prs=$(gh pr list --app dependabot --state open --limit 100 --json number --jq '.[].number')
+          fi
+
+          for pr in $prs; do
+            info=$(gh pr view "$pr" --json author,headRefName,headRefOid,state \
+              --jq '[.author.login, .headRefName, .headRefOid, .state] | @tsv')
+            author=$(echo "$info" | cut -f1)
+            branch=$(echo "$info" | cut -f2)
+            sha=$(echo "$info" | cut -f3)
+            state=$(echo "$info" | cut -f4)
+            if [ "$author" != "app/dependabot" ] || [ "$state" != "OPEN" ]; then
+              continue
+            fi
+
+            held=$(gh api "repos/$GH_REPO/actions/runs?status=action_required&per_page=100" \
+              --jq ".workflow_runs[] | select(.head_branch == \"$branch\") | .id")
+            for run in $held; do
+              if gh api -X POST "repos/$GH_REPO/actions/runs/$run/approve" >/dev/null; then
+                echo "approved held run $run for PR #$pr ($branch)"
+              fi
+            done
+
+            verdict=$(gh api "repos/$GH_REPO/actions/runs?head_sha=$sha&per_page=100" \
+              --jq '[.workflow_runs[] | select(.name == "ci")] | sort_by(.created_at) | last
+                    | "\(.id // 0) \(.status // "missing") \(.conclusion // "none")"')
+            run_id=$(echo "$verdict" | cut -d' ' -f1)
+            status=$(echo "$verdict" | cut -d' ' -f2)
+            conclusion=$(echo "$verdict" | cut -d' ' -f3)
+
+            if [ "$conclusion" != "success" ]; then
+              echo "PR #$pr ($branch): ci run $run_id is $status/$conclusion, not merging"
+              continue
+            fi
+
+            if gh pr merge --merge --match-head-commit "$sha" "$pr"; then
+              echo "merged PR #$pr ($branch) on green ci run $run_id"
+            else
+              echo "PR #$pr ($branch): merge refused on green ci run $run_id"
+            fi
+          done

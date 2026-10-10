@@ -101,9 +101,22 @@ git add flake.lock && git commit -m 'flake: bump index-repo' && git push
   PR and every push to `main`. The `CHROMA_TEST=1` suites are NOT in CI (they
   need the LAN ChromaDB) — you still own those locally.
 - Dependabot version updates (`.github/dependabot.yml`, cargo +
-  github-actions) are auto-merged **only** when that `ci` run is green
-  (`automerge-dependabot.yml` triggers on `workflow_run`). A breaking bump
-  therefore parks as an open red PR instead of landing on `main`.
+  github-actions) land only when that `ci` run is green. Two workflows do it:
+  `automerge-dependabot.yml` reacts to the `workflow_run` completion of `ci`,
+  and `unblock-dependabot.yml` (PR event + 15-minute schedule) covers what that
+  path cannot. The second one exists because a dependabot PR that edits a
+  workflow file — the `github-actions` group — has its `pull_request` runs
+  parked at `action_required` with zero jobs, and an approved run does **not**
+  produce the `workflow_run` completion the automerge listens for: approving
+  alone leaves the PR green but unmerged (observed 2026-10-10 on #20, runs
+  38085564969 / 38085564952). The unblock job approves those runs, waits for the
+  head's `ci` run to conclude, and only then merges; it deliberately does not
+  use `gh pr merge --auto`, because `main` is unprotected (no required checks),
+  so auto-merge would fire before `ci` finishes. A breaking bump still parks as
+  an open red PR instead of landing on `main`.
+- Merges made with `secrets.GITHUB_TOKEN` do not trigger `push` workflows, so a
+  dependabot landing produces no post-merge `ci` run on `main` — the PR's own
+  run is the only verification the merge commit gets.
 - Code scanning: CodeQL default queries plus `security-and-quality`
   (`codeql.yaml`, languages `rust` + `actions`). Two standing dismissals:
   `actions/unpinned-tag` (won't fix — actions stay on floating tags) and
