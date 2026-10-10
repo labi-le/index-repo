@@ -13,27 +13,32 @@
 
       # ---------------------------------------------------------------------------
       # Model FOD — 5 files from Qdrant/all-MiniLM-L6-v2-onnx on HuggingFace
+      # Pinned to a commit, never `resolve/main`: upstream rewrote tokenizer.json
+      # on 2026-09-27 and tokenizer_config.json on 2026-09-30, which turned every
+      # fresh FOD build into a hash mismatch and reddened `ci` (and with it
+      # Dependabot automerge) on all PRs. The revision below is the content these
+      # hashes were taken from.
       # ---------------------------------------------------------------------------
       model = pkgs.runCommand "all-MiniLM-L6-v2-onnx" { } ''
         mkdir -p $out
         cp ${pkgs.fetchurl {
-          url = "https://huggingface.co/Qdrant/all-MiniLM-L6-v2-onnx/resolve/main/model.onnx";
+          url = "https://huggingface.co/Qdrant/all-MiniLM-L6-v2-onnx/resolve/5f1b8cd78bc4fb444dd171e59b18f3a3af89a079/model.onnx";
           hash = "sha256-u9e0ZvbVjmRv3CvV/Wey9ek8C2hwEb1FSMQg971G8MU=";
         }} $out/model.onnx
         cp ${pkgs.fetchurl {
-          url = "https://huggingface.co/Qdrant/all-MiniLM-L6-v2-onnx/resolve/main/tokenizer.json";
+          url = "https://huggingface.co/Qdrant/all-MiniLM-L6-v2-onnx/resolve/5f1b8cd78bc4fb444dd171e59b18f3a3af89a079/tokenizer.json";
           hash = "sha256-2g55kzue1ReYo64niT08X6SiARJs73VYYpbfm00sYqA=";
         }} $out/tokenizer.json
         cp ${pkgs.fetchurl {
-          url = "https://huggingface.co/Qdrant/all-MiniLM-L6-v2-onnx/resolve/main/config.json";
+          url = "https://huggingface.co/Qdrant/all-MiniLM-L6-v2-onnx/resolve/5f1b8cd78bc4fb444dd171e59b18f3a3af89a079/config.json";
           hash = "sha256-G02OKjmIN37YtRmjHY0xAlol8cX4YGmY6AFBEUOO/Nc=";
         }} $out/config.json
         cp ${pkgs.fetchurl {
-          url = "https://huggingface.co/Qdrant/all-MiniLM-L6-v2-onnx/resolve/main/special_tokens_map.json";
+          url = "https://huggingface.co/Qdrant/all-MiniLM-L6-v2-onnx/resolve/5f1b8cd78bc4fb444dd171e59b18f3a3af89a079/special_tokens_map.json";
           hash = "sha256-XVtmLkIeqfrAdRdLsGiO4NlDFpmQC5BmKs1EsqNQUDo=";
         }} $out/special_tokens_map.json
         cp ${pkgs.fetchurl {
-          url = "https://huggingface.co/Qdrant/all-MiniLM-L6-v2-onnx/resolve/main/tokenizer_config.json";
+          url = "https://huggingface.co/Qdrant/all-MiniLM-L6-v2-onnx/resolve/5f1b8cd78bc4fb444dd171e59b18f3a3af89a079/tokenizer_config.json";
           hash = "sha256-vS4GpbIP0bE8qYi+3Idj0zLSQjgbT7yY+P6tRSQVj3k=";
         }} $out/tokenizer_config.json
       '';
