@@ -39,7 +39,7 @@ ort = { version = "=2.0.0-rc.12", default-features = false, features = ["load-dy
 tree-sitter-java = "0.23.5"
 tree-sitter-c = "0.24.2"
 tree-sitter-cpp = "0.23.4"
-tree-sitter-c-sharp = "0.23.5"
+tree-sitter-c-sharp = "0.24.0"
 tree-sitter-ruby = "0.23.1"
 
 [dev-dependencies]
